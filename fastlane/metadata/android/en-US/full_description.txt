@@ -1,0 +1,10 @@
+LeanType is an open-source keyboard based on HeliBoard.
+
+This version includes optional AI features powered by Gemini, Groq, or OpenAI-compatible providers.
+
+LeanType Features (in addition to original HeliBoard):
+* AI Proofreading & Translation (Multi-Provider)
+* Dual Toolbar / Split Suggestions
+* Touchpad Mode (Swipe spacebar to control cursor)
+* Custom AI Keys
+* Refined & Polished UI
