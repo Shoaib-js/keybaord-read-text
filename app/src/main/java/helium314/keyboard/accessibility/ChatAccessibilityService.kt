@@ -3,6 +3,7 @@ package helium314.keyboard.accessibility
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Intent
+import android.graphics.Rect
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -17,81 +18,71 @@ import kotlinx.coroutines.launch
  * Captures visible chat messages from foreground apps (WhatsApp, Telegram, etc.)
  * when the user explicitly enables this service in Android Accessibility Settings.
  *
- * ⚠️ IMPORTANT — Google Play Policy Note:
- * This service ONLY reads text that is visibly rendered on screen.
- * It does NOT intercept network traffic or encrypted data.
- * You MUST declare this usage clearly in your app's Data Safety section on Play Console.
- * Only use for "Reply Suggestions" feature — make this explicit in your Privacy Policy.
- *
  * How to enable: Settings → Accessibility → HeliboardL Chat Assistant → Enable
  */
 class ChatAccessibilityService : AccessibilityService() {
 
+    // ─────────────────────────────────────────────
+    // Constants — companion object mein sirf constants
+    // ─────────────────────────────────────────────
 
+    companion object {
+        const val TAG = "CHAT_DEBUG"
 
-    companion object {private const val TAG = "CHAT_DEBUG"
-
-        private fun dumpTree(node: AccessibilityNodeInfo?, depth: Int) {
-            node ?: return
-            val indent = "  ".repeat(depth)
-            val bounds = android.graphics.Rect()
-            node.getBoundsInScreen(bounds)
-            Log.v(TAG,
-                "${indent}Depth $depth → ${node.className}" +
-                    "  text=\"${node.text}\"" +
-                    "  id=\"${node.viewIdResourceName}\"" +
-                    "  bounds=[${bounds.left},${bounds.top}][${bounds.right},${bounds.bottom}]"
-            )
-            for (i in 0 until node.childCount) {
-                dumpTree(node.getChild(i), depth + 1)
-            }
-        }
-
-
-        // Supported chat app packages
         private val SUPPORTED_PACKAGES = setOf(
             "com.whatsapp",
-            "com.whatsapp.w4b",           // WhatsApp Business
-            "com.facebook.orca",           // Messenger
-            "com.instagram.android",       // Instagram
-            "org.telegram.messenger",      // Telegram
-            "com.google.android.apps.messaging", // Google Messages
-            "com.viber.voip",              // Viber
-            "kik.android"                  // Kik
+            "com.whatsapp.w4b",                   // WhatsApp Business
+            "com.facebook.orca",                   // Messenger
+            "com.instagram.android",               // Instagram
+            "org.telegram.messenger",              // Telegram
+            "com.google.android.apps.messaging",   // Google Messages
+            "com.viber.voip",                      // Viber
+            "kik.android"                          // Kik
         )
 
-        // Debounce: avoid spamming the AI API on every keystroke
         private const val DEBOUNCE_MS = 1500L
 
-        // Broadcast action to send messages to the keyboard service
         const val ACTION_CHAT_CONTEXT = "helium314.keyboard.CHAT_CONTEXT"
-        const val EXTRA_MESSAGES = "chat_messages"
-        const val EXTRA_PACKAGE = "source_package"
+        const val EXTRA_MESSAGES      = "chat_messages"
+        const val EXTRA_PACKAGE       = "source_package"
     }
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // ─────────────────────────────────────────────
+    // Instance variables
+    // ─────────────────────────────────────────────
+
+    private val serviceScope      = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var lastProcessedTime = 0L
     private var currentPackage: String? = null
 
-    // ─────────────────────────────────────────────
-    // Lifecycle
-    // ─────────────────────────────────────────────
+    // ═════════════════════════════════════════════
+    // LIFECYCLE
+    // ═════════════════════════════════════════════
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+
         val info = AccessibilityServiceInfo().apply {
-            eventTypes = AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
-                AccessibilityEvent.TYPE_VIEW_SCROLLED or
-                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
-                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            eventTypes =
+                AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED      or
+                    AccessibilityEvent.TYPE_VIEW_SCROLLED          or
+                    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                    AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-            notificationTimeout = 300  // ms between events
+
+            flags =
+                AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+
+            notificationTimeout = 300
             packageNames = SUPPORTED_PACKAGES.toTypedArray()
         }
         serviceInfo = info
-        Log.i(TAG, "ChatAccessibilityService connected ✅")
+
+        Log.i(TAG, "╔══════════════════════════════════════════════════╗")
+        Log.i(TAG, "║   ChatAccessibilityService CONNECTED ✅           ║")
+        Log.i(TAG, "╚══════════════════════════════════════════════════╝")
     }
 
     override fun onInterrupt() {
@@ -103,9 +94,9 @@ class ChatAccessibilityService : AccessibilityService() {
         return super.onUnbind(intent)
     }
 
-    // ─────────────────────────────────────────────
-    // Main Event Handler
-    // ─────────────────────────────────────────────
+    // ═════════════════════════════════════════════
+    // MAIN EVENT HANDLER
+    // ═════════════════════════════════════════════
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
@@ -115,48 +106,90 @@ class ChatAccessibilityService : AccessibilityService() {
 
         currentPackage = pkg
 
-        // Debounce rapid events
+        Log.d(TAG, "─────────────────────────────────────────────────────")
+        Log.d(TAG, "📡 EVENT  pkg=$pkg  type=${event.eventType}")
+
+        // Debounce — rapid events ignore karo
         val now = System.currentTimeMillis()
         if (now - lastProcessedTime < DEBOUNCE_MS) return
         lastProcessedTime = now
 
-        // Process on background thread to avoid blocking UI
+        // Background thread pe process karo
         serviceScope.launch {
             try {
-                val rootNode = rootInActiveWindow ?: return@launch
-                // TREE DUMP — pehle poora tree print karo
+                val rootNode = rootInActiveWindow ?: run {
+                    Log.w(TAG, "rootInActiveWindow is NULL — WhatsApp screen pe visible nahi hai")
+                    return@launch
+                }
+
+                // ── STEP 1: Poora tree dump karo (VERBOSE level pe dikhega) ──
                 Log.v(TAG, "▼▼▼▼▼▼▼▼▼▼  FULL ACCESSIBILITY TREE  ▼▼▼▼▼▼▼▼▼▼")
                 dumpTree(rootNode, 0)
                 Log.v(TAG, "▲▲▲▲▲▲▲▲▲▲  END OF TREE  ▲▲▲▲▲▲▲▲▲▲")
+
+                // ── STEP 2: Messages extract karo ──
                 val messages = extractChatMessages(rootNode)
                 rootNode.recycle()
 
+                // ── STEP 3: Messages logcat mein print karo ──
                 if (messages.isNotEmpty()) {
-                    Log.d(TAG, "Captured ${messages.size} messages from $pkg")
+                    Log.i(TAG, "╔══════════════════════════════════════════════════════╗")
+                    Log.i(TAG, "  CHAT_DEBUG MESSAGES  ←  $pkg")
+                    Log.i(TAG, "  ${messages.size} message(s) extracted")
+                    Log.i(TAG, "╚══════════════════════════════════════════════════════╝")
+                    messages.forEachIndexed { index, msg ->
+                        val sender = if (msg.isOwn) "👤 USER " else "💬 OTHER"
+                        Log.i(TAG, "  [$index] $sender: ${msg.text}")
+                    }
+                    Log.i(TAG, "══════════════════════════════════════════════════════")
+
                     broadcastChatContext(pkg, messages)
+
+                } else {
+                    Log.w(TAG, "No messages extracted from $pkg — kisi chat ke andar jao")
                 }
+
             } catch (e: Exception) {
                 Log.e(TAG, "Error extracting messages: ${e.message}")
             }
         }
     }
 
-    // ─────────────────────────────────────────────
-    // Node Traversal — Extract Chat Messages
-    // ─────────────────────────────────────────────
+    // ═════════════════════════════════════════════
+    // TREE DUMP  ← companion object ke BAHAR ✅
+    // ═════════════════════════════════════════════
 
+    private fun dumpTree(node: AccessibilityNodeInfo?, depth: Int) {
+        node ?: return
 
+        val indent = "  ".repeat(depth)
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
 
+        Log.v(TAG,
+            "${indent}Depth $depth → ${node.className}" +
+                "  text=\"${node.text}\"" +
+                "  id=\"${node.viewIdResourceName}\"" +
+                "  bounds=[${bounds.left},${bounds.top}][${bounds.right},${bounds.bottom}]"
+        )
+
+        for (i in 0 until node.childCount) {
+            dumpTree(node.getChild(i), depth + 1)
+        }
+    }
+
+    // ═════════════════════════════════════════════
+    // MESSAGE EXTRACTION
+    // ═════════════════════════════════════════════
 
     private fun extractChatMessages(rootNode: AccessibilityNodeInfo): List<ChatMessage> {
         val messages = mutableListOf<ChatMessage>()
         traverseNode(rootNode, messages, depth = 0)
 
-        // Deduplicate and filter noise
         return messages
-            .distinctBy { it.text }
-            .filter { it.text.length > 2 }
-            .takeLast(20) // Keep last 20 messages for context window
+            .distinctBy { it.text }            // duplicate text remove
+            .filter    { it.text.length > 2 }  // noise remove
+            .takeLast  (20)                    // last 20 messages rakho
     }
 
     private fun traverseNode(
@@ -164,63 +197,62 @@ class ChatAccessibilityService : AccessibilityService() {
         messages: MutableList<ChatMessage>,
         depth: Int
     ) {
-        if (node == null || depth > 15) return // limit recursion depth
+        if (node == null || depth > 15) return
 
         val text = node.text?.toString()?.trim()
-        val contentDesc = node.contentDescription?.toString()?.trim()
 
-        // Extract text from leaf nodes that look like messages
         if (!text.isNullOrEmpty() && isChatMessageNode(node, text)) {
             val isOwn = detectIfOwnMessage(node)
             messages.add(ChatMessage(
-                text = text,
-                isOwn = isOwn,
+                text      = text,
+                isOwn     = isOwn,
                 timestamp = System.currentTimeMillis()
             ))
         }
 
-        // Recurse into children
         for (i in 0 until node.childCount) {
             traverseNode(node.getChild(i), messages, depth + 1)
         }
     }
 
-    /**
-     * Heuristic: Is this node a chat message bubble?
-     * Filters out buttons, timestamps, status indicators, etc.
-     */
+    // ─────────────────────────────────────────────
+    // Filter: Kya ye node ek chat message hai?
+    // ─────────────────────────────────────────────
+
     private fun isChatMessageNode(node: AccessibilityNodeInfo, text: String): Boolean {
-        // Skip very short strings (timestamps like "12:30", status like "✓✓")
+        // Chhoti strings skip (timestamps "12:30", ticks "✓✓")
         if (text.length < 3) return false
 
-        // Skip pure numeric strings (timestamps, phone numbers in headers)
+        // Timestamps skip
         if (text.matches(Regex("\\d{1,2}:\\d{2}(\\s?(AM|PM))?"))) return false
 
-        // Skip "Delivered", "Read", "Seen" status strings
-        val skipWords = setOf("delivered", "read", "seen", "typing...", "online", "yesterday", "today")
+        // Status words skip
+        val skipWords = setOf(
+            "delivered", "read", "seen",
+            "typing...", "online", "yesterday", "today"
+        )
         if (text.lowercase() in skipWords) return false
 
-        // Prefer TextView-like nodes (not buttons/checkboxes)
+        // Buttons aur checkboxes skip
         val className = node.className?.toString() ?: ""
         if (className.contains("Button") || className.contains("CheckBox")) return false
 
         return true
     }
 
-    /**
-     * Rough heuristic to detect if a message was sent by the current user.
-     * Works for most apps by checking node position (right-aligned = own message).
-     * Not 100% accurate across all apps.
-     */
+    // ─────────────────────────────────────────────
+    // Detect: USER ka message hai ya OTHER ka?
+    // Right side = USER apna message
+    // Left side  = OTHER ka message
+    // ─────────────────────────────────────────────
+
     private fun detectIfOwnMessage(node: AccessibilityNodeInfo): Boolean {
         val parent = node.parent ?: return false
         return try {
-            val rect = android.graphics.Rect()
+            val rect = Rect()
             node.getBoundsInScreen(rect)
-            val parentRect = android.graphics.Rect()
-            parent.getBoundsInScreen(parentRect)
-            // If node is in the right ~60% of screen, likely own message
             val screenWidth = resources.displayMetrics.widthPixels
+            // Screen ke right 55%+ pe ho toh USER ka message
             rect.centerX() > (screenWidth * 0.55f)
         } catch (e: Exception) {
             false
@@ -229,30 +261,31 @@ class ChatAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ─────────────────────────────────────────────
-    // Broadcast to Keyboard Service
-    // ─────────────────────────────────────────────
+    // ═════════════════════════════════════════════
+    // BROADCAST TO KEYBOARD
+    // ═════════════════════════════════════════════
 
     private fun broadcastChatContext(packageName: String, messages: List<ChatMessage>) {
-        val messageArray = messages.map { "${if (it.isOwn) "ME" else "OTHER"}: ${it.text}" }
+        val messageArray = messages
+            .map { "${if (it.isOwn) "ME" else "OTHER"}: ${it.text}" }
             .toTypedArray()
 
         val intent = Intent(ACTION_CHAT_CONTEXT).apply {
             setPackage(applicationContext.packageName) // Internal broadcast only
-            putExtra(EXTRA_PACKAGE, packageName)
+            putExtra(EXTRA_PACKAGE,  packageName)
             putExtra(EXTRA_MESSAGES, messageArray)
         }
         sendBroadcast(intent)
-        Log.d(TAG, "Broadcasted ${messages.size} messages")
+        Log.d(TAG, "Broadcasted ${messages.size} messages to keyboard")
     }
 }
 
-// ─────────────────────────────────────────────
-// Data Model
-// ─────────────────────────────────────────────
+// ═════════════════════════════════════════════
+// DATA MODEL
+// ═════════════════════════════════════════════
 
 data class ChatMessage(
-    val text: String,
-    val isOwn: Boolean,
+    val text:      String,
+    val isOwn:     Boolean,
     val timestamp: Long
 )

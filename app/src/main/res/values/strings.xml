@@ -1153,4 +1153,5 @@ New dictionary:
 
     <string name="accessibility_service_description">HeliboardL reads visible chat messages from supported apps to provide AI-powered reply suggestions. No messages are stored. Data is only sent to your configured AI provider when you request suggestions.</string>
     <string name="accessibility_service_label">HeliboardL Chat Assistant</string>
+
 </resources>
