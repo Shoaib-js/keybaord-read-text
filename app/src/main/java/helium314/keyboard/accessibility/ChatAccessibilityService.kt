@@ -27,8 +27,26 @@ import kotlinx.coroutines.launch
  */
 class ChatAccessibilityService : AccessibilityService() {
 
-    companion object {
-        private const val TAG = "ChatAccessibility"
+
+
+    companion object {private const val TAG = "CHAT_DEBUG"
+
+        private fun dumpTree(node: AccessibilityNodeInfo?, depth: Int) {
+            node ?: return
+            val indent = "  ".repeat(depth)
+            val bounds = android.graphics.Rect()
+            node.getBoundsInScreen(bounds)
+            Log.v(TAG,
+                "${indent}Depth $depth → ${node.className}" +
+                    "  text=\"${node.text}\"" +
+                    "  id=\"${node.viewIdResourceName}\"" +
+                    "  bounds=[${bounds.left},${bounds.top}][${bounds.right},${bounds.bottom}]"
+            )
+            for (i in 0 until node.childCount) {
+                dumpTree(node.getChild(i), depth + 1)
+            }
+        }
+
 
         // Supported chat app packages
         private val SUPPORTED_PACKAGES = setOf(
@@ -106,6 +124,10 @@ class ChatAccessibilityService : AccessibilityService() {
         serviceScope.launch {
             try {
                 val rootNode = rootInActiveWindow ?: return@launch
+                // TREE DUMP — pehle poora tree print karo
+                Log.v(TAG, "▼▼▼▼▼▼▼▼▼▼  FULL ACCESSIBILITY TREE  ▼▼▼▼▼▼▼▼▼▼")
+                dumpTree(rootNode, 0)
+                Log.v(TAG, "▲▲▲▲▲▲▲▲▲▲  END OF TREE  ▲▲▲▲▲▲▲▲▲▲")
                 val messages = extractChatMessages(rootNode)
                 rootNode.recycle()
 
@@ -122,6 +144,9 @@ class ChatAccessibilityService : AccessibilityService() {
     // ─────────────────────────────────────────────
     // Node Traversal — Extract Chat Messages
     // ─────────────────────────────────────────────
+
+
+
 
     private fun extractChatMessages(rootNode: AccessibilityNodeInfo): List<ChatMessage> {
         val messages = mutableListOf<ChatMessage>()
