@@ -99,6 +99,8 @@ import androidx.core.content.ContextCompat;
 // AI Chat Suggestion Helper
 import helium314.keyboard.ai.ChatAiSuggestionHelper;
 
+import helium314.keyboard.ai.AiTonePanel;
+
 /**
  * Input method implementation for Qwerty'ish keyboard.
  */
@@ -177,6 +179,8 @@ public class LatinIME extends InputMethodService implements
 
     // ── AI Chat Suggestion Helper ──────────────────────────────────────────
     private ChatAiSuggestionHelper mChatAiHelper;
+    private AiTonePanel mAiTonePanel;
+    private boolean mIsAiPanelVisible = false;
     // ──────────────────────────────────────────────────────────────────────
 
     private final ClipboardHistoryManager mClipboardHistoryManager = new ClipboardHistoryManager(this);
@@ -562,24 +566,35 @@ public class LatinIME extends InputMethodService implements
 
         StatsUtils.onCreate(mSettings.getCurrent(), mRichImm);
 
-        // ── Initialize AI Chat Suggestion Helper ───────────────────────────
-        String aiApiKey = getSharedPreferences(getPackageName() + "_preferences", MODE_PRIVATE)
-            .getString("ai_gemini_api_key", "");
-        if (aiApiKey != null && !aiApiKey.isEmpty()) {
-            mChatAiHelper = new ChatAiSuggestionHelper(
-                this,
-                aiApiKey,
-                ChatAiSuggestionHelper.AiProvider.GEMINI,
-                suggestions -> {
-                    // TODO: Pass suggestions to your suggestion strip UI
-                    // Example: runOnUiThread(() -> showAiSuggestions(suggestions));
-                    return null;
-                }
-            );
-            mChatAiHelper.register();
-            Log.i(TAG, "ChatAiSuggestionHelper initialized");
-        }
+        // ── Initialize ChatAiSuggestionHelper ──────────────────────────────
+        String backendUrl = "https://your-backend-server.com/generate-reply";
+        // TODO: Upar wali line mein apna actual backend URL daalo
+
+        mChatAiHelper = new ChatAiSuggestionHelper(
+            this,
+            backendUrl,
+            suggestions -> {
+                mHandler.post(() -> {
+                    showAiSuggestions(suggestions);
+                });
+                return null;
+            },
+            errorMessage -> {
+                mHandler.post(() -> {
+                    Log.e(TAG, "AI Error: " + errorMessage);
+                    android.widget.Toast.makeText(
+                        LatinIME.this,
+                        errorMessage,
+                        android.widget.Toast.LENGTH_SHORT
+                    ).show();
+                });
+                return null;
+            }
+        );
+        mChatAiHelper.register();
+        Log.i(TAG, "ChatAiSuggestionHelper initialized");
         // ──────────────────────────────────────────────────────────────────
+
     }
 
     private void loadSettings() {
@@ -1596,4 +1611,73 @@ public class LatinIME extends InputMethodService implements
             }
         }
     }
+
+    // ════════════════════════════════════════════════════════════
+    // AI REPLY METHODS
+    // ════════════════════════════════════════════════════════════
+
+    // SuggestionStripView mein AI suggestions dikhao
+    public void showAiSuggestions(java.util.List<String> suggestions) {
+        if (suggestions == null || suggestions.isEmpty()) return;
+
+        final ArrayList<SuggestedWords.SuggestedWordInfo> wordInfoList = new ArrayList<>();
+        for (String suggestion : suggestions) {
+            wordInfoList.add(new SuggestedWords.SuggestedWordInfo(
+                suggestion,
+                "",
+                SuggestedWords.SuggestedWordInfo.MAX_SCORE,
+                SuggestedWords.SuggestedWordInfo.KIND_APP_DEFINED,
+                null,
+                SuggestedWords.SuggestedWordInfo.NOT_AN_INDEX,
+                SuggestedWords.SuggestedWordInfo.NOT_A_CONFIDENCE
+            ));
+        }
+
+        final SuggestedWords suggestedWords = new SuggestedWords(
+            wordInfoList,
+            null,
+            null,
+            false,
+            false,
+            false,
+            SuggestedWords.INPUT_STYLE_APPLICATION_SPECIFIED,
+            SuggestedWords.NOT_A_SEQUENCE_NUMBER
+        );
+
+        setSuggestedWords(suggestedWords);
+        Log.d(TAG, "✅ Showing " + suggestions.size() + " AI suggestions");
+    }
+
+    // Tone panel show/hide
+    public void showAiTonePanel() {
+        mIsAiPanelVisible = true;
+    }
+
+    public void hideAiTonePanel() {
+        mIsAiPanelVisible = false;
+    }
+
+    public boolean isAiPanelVisible() {
+        return mIsAiPanelVisible;
+    }
+
+    // SuggestionStripView se call hoga jab user tone select kare
+    public void onAiToneSelected(String tone) {
+        if (mChatAiHelper == null) {
+            Log.w(TAG, "ChatAiHelper not initialized");
+            return;
+        }
+        if (!mChatAiHelper.hasContext()) {
+            android.widget.Toast.makeText(
+                this,
+                "Pehle WhatsApp ya Instagram chat kholo",
+                android.widget.Toast.LENGTH_SHORT
+            ).show();
+            return;
+        }
+        Log.d(TAG, "🎭 Requesting suggestions with tone: " + tone);
+        mChatAiHelper.requestSuggestions(tone);
+    }
 }
+
+

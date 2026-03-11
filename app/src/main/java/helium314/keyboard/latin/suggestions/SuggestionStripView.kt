@@ -63,6 +63,8 @@ import helium314.keyboard.latin.utils.setToolbarButtonsActivatedStateOnPrefChang
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
+import helium314.keyboard.ai.AiTonePanel
+import helium314.keyboard.latin.LatinIME
 @SuppressLint("InflateParams")
 class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int) :
     RelativeLayout(context, attrs, defStyle), View.OnClickListener, OnLongClickListener, OnSharedPreferenceChangeListener {
@@ -117,6 +119,11 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
     private val pinnedKeys: ViewGroup = findViewById(R.id.pinned_keys)
     private val suggestionsStrip: ViewGroup = findViewById(R.id.suggestions_strip)
     private val toolbarExpandKey = findViewById<ImageButton>(R.id.suggestions_strip_toolbar_key)
+
+    // ── AI Tone Panel ──
+    private var aiTonePanel: AiTonePanel? = null
+    private var isAiPanelShowing = false
+
     private val toolbarArrowIcon = KeyboardIconsSet.instance.getNewDrawable(KeyboardIconsSet.NAME_TOOLBAR_KEY, context)
     private val defaultToolbarBackground: Drawable = toolbarExpandKey.background
     private val enabledToolKeyBackground = GradientDrawable()
@@ -166,12 +173,12 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
 
         if (Settings.getValues().mSplitToolbar) {
             val stripHeight = resources.getDimensionPixelSize(R.dimen.config_suggestions_strip_height)
-            
+
             val wrapper = findViewById<LinearLayout>(R.id.suggestions_strip_wrapper)
-            
+
             // Set wrapper to vertical
             wrapper.orientation = LinearLayout.VERTICAL
-            
+
             // Create toolbar row for Expand Key, Toolbar, Pinned Keys
             val toolbarRow = LinearLayout(context)
             toolbarRow.orientation = LinearLayout.HORIZONTAL
@@ -179,40 +186,40 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 stripHeight
             )
-            
+
             // Remove views from wrapper
             wrapper.removeView(toolbarExpandKey)
             wrapper.removeView(toolbarContainer)
             wrapper.removeView(pinnedKeys)
-            
+
             // Set new layout params when adding to toolbarRow
             val expandKeyParams = LinearLayout.LayoutParams(
                 toolbarExpandKey.layoutParams.width,
                 LinearLayout.LayoutParams.MATCH_PARENT
             )
             toolbarExpandKey.layoutParams = expandKeyParams
-            
+
             val toolbarParams = LinearLayout.LayoutParams(
                 0,
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 1f  // weight
             )
             toolbarContainer.layoutParams = toolbarParams
-            
+
             val pinnedParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.MATCH_PARENT
             )
             pinnedKeys.layoutParams = pinnedParams
-            
+
             // Add views to toolbar row
             toolbarRow.addView(toolbarExpandKey)
             toolbarRow.addView(toolbarContainer)
             toolbarRow.addView(pinnedKeys)
-            
+
             // Add toolbar row to wrapper at the START (Top) - Toolbar at top, Suggestions at bottom
             wrapper.addView(toolbarRow, 0)
-            
+
             // Set suggestions strip params - use weight to fill remaining space
             val suggestionsParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -233,7 +240,7 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val stripHeight = resources.getDimensionPixelSize(R.dimen.config_suggestions_strip_height)
         val split = Settings.getValues().mSplitToolbar
-        
+
         val newHeightSpec = if (split) {
             MeasureSpec.makeMeasureSpec(stripHeight * 2, MeasureSpec.EXACTLY)
         } else {
@@ -303,7 +310,7 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
         // avoid showing toolbar keys when locked
         val locked = isDeviceLocked(context)
         val split = Settings.getValues().mSplitToolbar
-        
+
         // In split mode, show only full toolbar, hide pinned keys
         if (split) {
             // suggestionsStrip visibility is handled dynamically in updateSplitToolbarState
@@ -379,7 +386,7 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
     fun showLoadingAnimation() {
         if (isLoadingAnimationActive) return
         isLoadingAnimationActive = true
-        
+
         // Set loading border on the whole toolbar view
         this.foreground = loadingBorderDrawable
 
@@ -393,10 +400,10 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
                 Settings.getValues().mColors.setColor(proofreadKey, ColorType.TOOL_BAR_KEY)
             }
         }
-        
+
         // Get accent color from theme (GESTURE_TRAIL is the accent color)
-        val accentColor = Settings.getValues().mColors.get(ColorType.GESTURE_TRAIL) 
-        
+        val accentColor = Settings.getValues().mColors.get(ColorType.GESTURE_TRAIL)
+
         // Create pulse animation
         loadingAnimator = ValueAnimator.ofFloat(0.25f, 1f).apply {
             duration = 800
@@ -417,7 +424,7 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
     fun hideLoadingAnimation() {
         if (!isLoadingAnimationActive) return
         isLoadingAnimationActive = false
-        
+
         loadingAnimator?.cancel()
         loadingAnimator = null
         loadingBorderDrawable.setStroke(4, Color.TRANSPARENT)
@@ -485,34 +492,63 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
         return true
     }
 
+
+
     override fun onClick(view: View) {
-        AudioAndHapticFeedbackManager.getInstance().performHapticAndAudioFeedback(KeyCode.NOT_SPECIFIED, this, HapticEvent.KEY_PRESS)
+
+        AudioAndHapticFeedbackManager.getInstance()
+            .performHapticAndAudioFeedback(
+                KeyCode.NOT_SPECIFIED,
+                this,
+                HapticEvent.KEY_PRESS
+            )
+
         val tag = view.tag
+
         if (tag is ToolbarKey) {
+
+            // AI button
+            if (tag === ToolbarKey.CUSTOM_AI_1) {
+                handleAiButtonClick()
+                return
+            }
+
             val code = getCodeForToolbarKey(tag)
+
             if (code != KeyCode.UNSPECIFIED) {
                 Log.d(TAG, "click toolbar key $tag")
-                listener.onCodeInput(code, Constants.SUGGESTION_STRIP_COORDINATE, Constants.SUGGESTION_STRIP_COORDINATE, false)
-                if (tag === ToolbarKey.INCOGNITO) updateKeys() // update expand key icon
+
+                listener.onCodeInput(
+                    code,
+                    Constants.SUGGESTION_STRIP_COORDINATE,
+                    Constants.SUGGESTION_STRIP_COORDINATE,
+                    false
+                )
+
+                if (tag === ToolbarKey.INCOGNITO) updateKeys()
+
                 return
             }
         }
+
+        // toolbar expand button
         if (view === toolbarExpandKey) {
             val willBeVisible = toolbarContainer.visibility != VISIBLE
             isToolbarManuallyOpen = willBeVisible
             setToolbarVisibility(willBeVisible)
         }
 
-        // tag for word views is set in SuggestionStripLayoutHelper (setupWordViewsTextAndColor, layoutPunctuationSuggestions)
+        // suggestion word click
         if (tag is Int) {
+
             if (tag >= suggestedWords.size()) {
                 return
             }
+
             val wordInfo = suggestedWords.getInfo(tag)
             listener.pickSuggestionManually(wordInfo)
         }
     }
-
     override fun onLongClick(view: View): Boolean {
         AudioAndHapticFeedbackManager.getInstance().performHapticFeedback(this, HapticEvent.KEY_LONG_PRESS)
         if (view.tag is ToolbarKey) {
@@ -530,10 +566,10 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
 
     private fun onLongClickToolbarKey(view: View) {
         val tag = view.tag as? ToolbarKey ?: return
-        
+
         // Disable pinning and long press actions when split toolbar is enabled
         if (Settings.getValues().mSplitToolbar) return
-        
+
         if (Settings.getValues().mQuickPinToolbarKeys) {
             if (view.parent === toolbar) {
                 // Pin: Move from toolbar to pinned keys
@@ -685,14 +721,14 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
         val hideToolbarKeys = isDeviceLocked(context)
         // Keep click listener active in split mode (though key is hidden, better to leave logic clean)
         toolbarExpandKey.setOnClickListener(if (hideToolbarKeys || !toolbarIsExpandable) null else this)
-        
+
         if (split) {
             toolbarExpandKey.isVisible = false
             pinnedKeys.isVisible = false // Hide pinned keys completely in split mode
-            
+
             toolbarContainer.isVisible = !hideToolbarKeys // Show full toolbar container
             toolbar.visibility = VISIBLE // Show toolbar
-            
+
             updateVoiceKey() // Re-apply voice logic to pinned keys
             layoutHelper.setSuggestionsCountInStrip(5)
         } else {
@@ -720,14 +756,14 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
         val pinnedKeysList = getPinnedToolbarKeys(context.prefs())
         val mToolbarMode = Settings.getValues().mToolbarMode
         val isSplitToolbar = Settings.getValues().mSplitToolbar
-        
+
         // Toolbar keys setup
         // Always populate toolbar keys if mode allows, visibility handled in updateKeys
         if (mToolbarMode == ToolbarMode.TOOLBAR_KEYS || mToolbarMode == ToolbarMode.EXPANDABLE) {
             // Filter out pinned keys from toolbar to avoid duplication and keep UI clean
             // In split mode, we show ALL enabled keys in the toolbar, ignoring pin status
             val keysToRender = if (isSplitToolbar) {
-                getEnabledToolbarKeys(context.prefs()) 
+                getEnabledToolbarKeys(context.prefs())
             } else {
                 getEnabledToolbarKeys(context.prefs()).filterNot { it in pinnedKeysList }
             }
@@ -738,7 +774,7 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
                 toolbar.addView(button)
             }
         }
-        
+
         // Only draw pinned keys if not in split mode
         if (!isSplitToolbar && !Settings.getValues().mSuggestionStripHiddenPerUserSettings) {
             for (pinnedKey in pinnedKeysList) {
@@ -754,10 +790,10 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
     private fun updateSplitToolbarState() {
         if (!Settings.getValues().mSplitToolbar) return
         suggestionsStrip.isVisible = true
-        
+
         val PLACEHOLDER_TAG = "PLACEHOLDER_VIEW"
         val placeholder = suggestionsStrip.findViewWithTag<View>(PLACEHOLDER_TAG)
-        
+
         // Check if there are any visible suggestions with actual text content
         var hasRealSuggestions = false
         for (i in 0 until suggestionsStrip.childCount) {
@@ -778,20 +814,20 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
                  placeholderContainer.tag = PLACEHOLDER_TAG
                  placeholderContainer.orientation = LinearLayout.HORIZONTAL
                  placeholderContainer.layoutParams = LinearLayout.LayoutParams(
-                     LinearLayout.LayoutParams.MATCH_PARENT, 
+                     LinearLayout.LayoutParams.MATCH_PARENT,
                      LinearLayout.LayoutParams.MATCH_PARENT
                  )
-                 
+
                  // Random suggestion words to display
                  val randomSuggestions = listOf(
                      "the", "and", "for", "you", "with",
                      "have", "this", "from", "will", "can",
                      "hello", "thanks", "please", "okay", "good"
                  ).shuffled().take(5)
-                 
+
                  val colors = Settings.getValues().mColors
                  val customTypeface = Settings.getInstance().customTypeface
-                 
+
                  randomSuggestions.forEach { word ->
                      val suggestionView = TextView(context, null, R.attr.suggestionWordStyle)
                      suggestionView.text = word
@@ -801,7 +837,7 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
                          suggestionView.typeface = customTypeface
                      colors.setBackground(suggestionView, ColorType.STRIP_BACKGROUND)
                      suggestionView.setTextColor(colors.get(ColorType.KEY_TEXT))
-                     
+
                      val params = LinearLayout.LayoutParams(
                          0,
                          LinearLayout.LayoutParams.MATCH_PARENT,
@@ -810,7 +846,7 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
                      suggestionView.layoutParams = params
                      placeholderContainer.addView(suggestionView)
                  }
-                 
+
                  suggestionsStrip.addView(placeholderContainer)
             }
         }
@@ -855,11 +891,11 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
             if (customTypeface != null) emojiView.typeface = customTypeface
             emojiView.gravity = android.view.Gravity.CENTER
             emojiView.setPadding(
-                8.dpToPx(resources), 2.dpToPx(resources), 
+                8.dpToPx(resources), 2.dpToPx(resources),
                 8.dpToPx(resources), 2.dpToPx(resources)
             )
             emojiView.layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, 
+                ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
             emojiView.setOnClickListener {
@@ -892,4 +928,65 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
         private const val DEBUG_INFO_TEXT_SIZE_IN_DIP = 6.5f
         private val TAG = SuggestionStripView::class.java.simpleName
     }
+
+
+    private fun handleAiButtonClick() {
+        if (isAiPanelShowing) {
+            hideAiTonePanel()
+        } else {
+            showAiTonePanel()
+        }
+    }
+
+
+    private fun showAiTonePanel() {
+
+        if (aiTonePanel == null) {
+            aiTonePanel = AiTonePanel(context).apply {
+                onToneSelected = { tone ->
+                    val latinIME = context as? LatinIME
+                        ?: (context as? android.content.ContextWrapper)?.baseContext as? LatinIME
+
+                    latinIME?.onAiToneSelected(tone)
+                }
+            }
+        }
+
+        this.visibility = INVISIBLE
+
+        val parent = this.parent as? ViewGroup
+
+        parent?.let { p ->
+            if (aiTonePanel?.parent != null) {
+                (aiTonePanel?.parent as? ViewGroup)?.removeView(aiTonePanel)
+            }
+
+            val params = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                this.height
+            )
+
+            p.addView(aiTonePanel, params)
+            aiTonePanel?.visibility = VISIBLE
+            aiTonePanel?.reset()
+        }
+
+        isAiPanelShowing = true
+    }
+
+    fun hideAiTonePanel() {
+        aiTonePanel?.let { panel ->
+            (panel.parent as? ViewGroup)?.removeView(panel)
+        }
+
+        this.visibility = VISIBLE
+        isAiPanelShowing = false
+    }
+
+
+    fun showAiSuggestionsReady() {
+        hideAiTonePanel()
+    }
+
+
 }
