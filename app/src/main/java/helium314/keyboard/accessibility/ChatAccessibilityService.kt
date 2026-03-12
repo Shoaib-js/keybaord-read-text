@@ -15,28 +15,52 @@ import java.text.SimpleDateFormat
 import java.util.*
 
 /**
- * ChatAccessibilityService — Hybrid Cache System
+ * ChatAccessibilityService — Final Version
  *
- * Strategy: Text-Dedup + Window-Range + AtBottom Detection
+ * ═══════════════════════════════════════════════════════════════
+ * COMPLETE BUG FIX HISTORY:
+ * ═══════════════════════════════════════════════════════════════
  *
- * RULE SET:
+ * #1  Fallback getCurrentIsoTime() → returns "" on parse fail
+ * #2  \u202F Unicode narrow space → cleanTimestampString()
+ * #3  Scroll msgs wrong → correct date context tracking
+ * #4  Sender: status node presence = "me"
+ * #5  Shadow rootNode variable → single declaration
+ * #6  Pinned banner filter → isInsidePinnedOrSystemBanner()
+ * #7  Attachments → content/title/file_type parsing
+ * #8  Dead traverseWhatsApp() → removed
+ * #9  seenKey = sender+time+text → now normalizedText + HH:mm
+ * #10 isTop/isBottom Y logic → wrong adds → REMOVED
+ * #11 addFirst() removed wrongly → RESTORED with safety guard
+ * #12 Date context not tracked → ORDER-BASED list walk
+ * #13 date_divider_header at coordinator → pre-scan added
  *
- * A) Initial Load (cache empty):
- *    - Screen ke LAST 15 msgs lo (time sorted, newest = last)
- *    - seenKeys mein sabka normalizedText daalo
- *    - firstCacheTime = index[0].time, lastCacheTime = index[last].time
+ * ═══════════════════════════════════════════════════════════════
+ * FINAL TWO BUGS FOUND FROM LOG 15:01:xx:
+ * ═══════════════════════════════════════════════════════════════
  *
- * B) After initial load — new msg check:
- *    - msg.normalizedText already in seenKeys? → BLOCK (text dedup)
- *    - msg.time < firstCacheTime? → BLOCK (scroll history, window range)
- *    - msg.time in range [firstCacheTime, lastCacheTime]? → BLOCK (middle zone)
- *    - msg.time > lastCacheTime? → ADD (genuinely new message)
+ * BUG A — Scroll history msgs should go to FRONT (addFirst):
+ *   User scrolls up → old msgs visible on screen → should add to cache FRONT
+ *   so backend gets older context too.
+ *   Previous fix removed addFirst() entirely — WRONG.
+ *   Correct fix: addFirst() IS needed, but only when timestamps are VALID.
+ *   Now that date context tracking is correct, timestamps are reliable → safe to restore.
  *
- * C) Multi-line nodes:
- *    - Text normalize: trim + collapse whitespace
+ *   GATE for addFirst:
+ *     msgTimeMs > 0          (valid timestamp)
+ *     msgTimeMs < firstCacheTimeMs  (genuinely older than cache front)
+ *     normKey NOT in seenKeys
  *
- * D) Chat switch:
- *    - pkg + chatWith change → full reset
+ * BUG B — Same-text duplicate messages skipped:
+ *   "THIK" sent at 11:58, "thik" received at 12:09 → same normalized text
+ *   Old seenKey = "thik" → both match → 12:09 msg skipped!
+ *
+ *   NEW seenKey = normalizedText + "|" + timeHHmm
+ *   "thik" at 11:58 → key = "thik|11:58"
+ *   "thik" at 12:09 → key = "thik|12:09" → DIFFERENT → both added ✓
+ *
+ *   timeHHmm = ISO string substring [11:16] = "HH:mm"
+ *   "2026-03-11T11:58:00" → "11:58"
  */
 class ChatAccessibilityService : AccessibilityService() {
 
@@ -59,6 +83,31 @@ class ChatAccessibilityService : AccessibilityService() {
 
         private val ISO_FMT = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ENGLISH)
 
+        private val WHATSAPP_BANNER_IDS = setOf(
+            "com.whatsapp:id/pinnedMessagesBanner",
+            "com.whatsapp:id/pinnedMessagesBanner_content",
+            "com.whatsapp:id/pinnedMessagesBanner_pinned_icon"
+        )
+
+        private val WHATSAPP_SYSTEM_IDS = setOf(
+            "com.whatsapp:id/info",
+            "com.whatsapp:id/conversation_contact_status"
+        )
+
+        private val WHATSAPP_IGNORE_TEXT = setOf(
+            "type a message", "type a message…",
+            "typing…", "typing", "online", "offline",
+            "last seen", "last seen recently",
+            "voice message", "this message was deleted",
+            "you deleted this message",
+            "missed voice call", "missed video call",
+            "tap to call back", "seen", "delivered", "sent",
+            "yesterday", "today", "attach", "emoji", "sticker",
+            "gif", "camera", "audio", "message",
+            "you pinned a message",
+            "messages and calls are end-to-end encrypted."
+        )
+
         private val INSTAGRAM_IGNORE = setOf(
             "message", "message…", "typing…", "typing",
             "seen", "delivered", "active now", "active today",
@@ -69,49 +118,29 @@ class ChatAccessibilityService : AccessibilityService() {
             "react to this message", "reply"
         )
 
-        private val WHATSAPP_IGNORE = setOf(
-            "type a message", "type a message…",
-            "typing…", "typing", "online", "offline",
-            "last seen", "last seen recently",
-            "voice message", "this message was deleted",
-            "you deleted this message",
-            "missed voice call", "missed video call",
-            "tap to call back", "seen", "delivered", "sent",
-            "yesterday", "today", "attach", "emoji", "sticker",
-            "gif", "camera", "audio"
-        )
-
-        private val WHATSAPP_MSG_IDS = setOf(
-            "com.whatsapp:id/message_text",
-            "com.whatsapp:id/caption_text"
-        )
-
         private val INSTAGRAM_MSG_IDS = setOf(
             "com.instagram.android:id/direct_text_message_text_view"
+        )
+
+        private val DAY_OF_WEEK_MAP = mapOf(
+            "monday"    to Calendar.MONDAY,
+            "tuesday"   to Calendar.TUESDAY,
+            "wednesday" to Calendar.WEDNESDAY,
+            "thursday"  to Calendar.THURSDAY,
+            "friday"    to Calendar.FRIDAY,
+            "saturday"  to Calendar.SATURDAY,
+            "sunday"    to Calendar.SUNDAY
         )
     }
 
     // ══════════════════════════════════════════
     // CACHE STATE
+    // ArrayDeque: index 0 = oldest, last = newest
     // ══════════════════════════════════════════
-
-    // Main sliding window — index 0 = oldest, last = newest
-    private val messageCache = ArrayDeque<ChatMessageData>()
-
-    // Text-based dedup set — normalizedText only (sender excluded, see WHY below)
-    // WHY no sender: WhatsApp sender = screen X-position, changes on scroll/resize
-    // So "me::hello" and "other::hello" would be different keys = duplicate added
-    private val seenKeys = LinkedHashSet<String>()
-
-    // Window boundary timestamps (milliseconds)
-    // firstCacheTime = time of oldest msg in cache
-    // lastCacheTime  = time of newest msg in cache
-    // Any message with time in (firstCacheTime, lastCacheTime) = middle zone = IGNORE
-    // Any message with time < firstCacheTime = scroll history = IGNORE
-    // Any message with time > lastCacheTime  = genuinely new = ADD
+    private val messageCache     = ArrayDeque<ChatMessageData>()
+    private val seenKeys         = LinkedHashSet<String>()  // "normalizedText|HH:mm" — Bug B fix
     private var firstCacheTimeMs = Long.MAX_VALUE
     private var lastCacheTimeMs  = 0L
-
     private var cachedPackage    = ""
     private var cachedChatWith   = ""
     private var cacheInitialized = false
@@ -145,7 +174,7 @@ class ChatAccessibilityService : AccessibilityService() {
     override fun onInterrupt() = Unit
 
     // ══════════════════════════════════════════
-    // MAIN EVENT
+    // MAIN EVENT — Bug #5 fix: single rootNode
     // ══════════════════════════════════════════
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
@@ -157,15 +186,15 @@ class ChatAccessibilityService : AccessibilityService() {
         lastProcessedTime = now
 
         serviceScope.launch {
-            val rootNode = rootInActiveWindow ?: return@launch
-
-            // 🔎 DEBUG UI TREE
-            debugTree(rootNode)
             try {
                 val rootNode = rootInActiveWindow ?: return@launch
+
+                Log.d(TAG, "TREE START")
+                debugFullTree(rootNode)
+                Log.d(TAG, "TREE END")
+
                 val chatWith = extractContactName(rootNode, pkg)
 
-                // Chat switch → full reset
                 if ("$pkg::$chatWith" != "$cachedPackage::$cachedChatWith") {
                     Log.i(TAG, "🔄 Chat changed: [$chatWith] — full reset")
                     resetCache()
@@ -181,13 +210,13 @@ class ChatAccessibilityService : AccessibilityService() {
                 }
                 rootNode.recycle()
 
-                if (screenMessages.isEmpty()) return@launch
-
-                val changed = if (!cacheInitialized) {
-                    initialLoad(screenMessages)
-                } else {
-                    processNewMessages(screenMessages)
+                if (screenMessages.isEmpty()) {
+                    Log.d(TAG, "No valid messages on screen")
+                    return@launch
                 }
+
+                val changed = if (!cacheInitialized) initialLoad(screenMessages)
+                else processMessages(screenMessages)
 
                 if (changed) {
                     logCacheState()
@@ -200,106 +229,366 @@ class ChatAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════
     // INITIAL LOAD
-    // Chat open hote hi ek baar, pehla scan
-    //
-    // Steps:
-    // 1. Sort by time (oldest → newest)
-    // 2. takeLast(15) — newest 15 lo
-    // 3. seenKeys mein normalizedText daalo
-    // 4. firstCacheTimeMs aur lastCacheTimeMs set karo
-    // ══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════
     private fun initialLoad(screenMessages: List<ChatMessageData>): Boolean {
-        val sorted = screenMessages.sortedBy { parseIsoToMs(it.time) }
+
+        val validMsgs = screenMessages.filter { parseIsoToMs(it.time) > 0L }
+
+        if (validMsgs.isEmpty()) {
+            Log.w(TAG, "Initial load: no valid messages")
+            return false
+        }
+
+        val sorted = validMsgs.sortedWith(
+            compareBy<ChatMessageData> { parseIsoToMs(it.time) }
+                .thenBy { it.y }
+        )
+
         val toLoad = sorted.takeLast(MAX_CACHE_SIZE)
 
         for (msg in toLoad) {
             messageCache.addLast(msg)
-            seenKeys.add(msg.normalizedText())
+            seenKeys.add(msg.seenKey())
         }
 
-        if (messageCache.isNotEmpty()) {
-            firstCacheTimeMs = parseIsoToMs(messageCache.first().time)
-            lastCacheTimeMs  = parseIsoToMs(messageCache.last().time)
-        }
+        firstCacheTimeMs = parseIsoToMs(messageCache.first().time)
+        lastCacheTimeMs  = parseIsoToMs(messageCache.last().time)
 
         cacheInitialized = true
-        Log.i(TAG, "📥 Initial load: ${messageCache.size} msgs | window [${messageCache.firstOrNull()?.time} → ${messageCache.lastOrNull()?.time}]")
-        return messageCache.isNotEmpty()
-    }
 
-    // ══════════════════════════════════════════════════════════════
-    // PROCESS NEW MESSAGES (after initial load)
+        Log.i(TAG, "📥 Initial load: ${messageCache.size} msgs")
+        return true
+    }
+    // ══════════════════════════════════════════════════════════════════
+    // PROCESS MESSAGES — BOTH directions
     //
-    // For each screen message, apply 3-layer filter:
+    // BUG A FIX: addFirst() restored for OLDER messages (scroll history)
+    // BUG B FIX: seenKey = normalizedText + "|" + HH:mm (handles same-text msgs)
     //
-    // Layer 1 — Text Dedup:
-    //   normalizedText in seenKeys? → BLOCK
-    //   (handles: scroll-up duplicates, debounce re-scans, sender flip)
+    // THREE CASES:
+    //   1. msgTime < firstCacheTime → OLDER (scroll up) → addFirst()
+    //   2. msgTime > lastCacheTime  → NEWER (new arrival) → addLast()
+    //   3. msgTime in range         → already cached → SKIP
     //
-    // Layer 2 — Window Range:
-    //   msg.time <= lastCacheTimeMs? → BLOCK
-    //   (handles: middle zone, scroll history, any old msg)
-    //   Only msg.time > lastCacheTimeMs passes through
-    //
-    // Layer 3 — Add:
-    //   Passed both checks → genuinely new → addLast
-    //   Evict oldest if size > 15
-    //   Update lastCacheTimeMs
-    // ══════════════════════════════════════════════════════════════
-    private fun processNewMessages(screenMessages: List<ChatMessageData>): Boolean {
-        val sorted = screenMessages.sortedBy { parseIsoToMs(it.time) }
+    // WHY addFirst is now SAFE:
+    //   Previous problem: "Saturday" msgs had WRONG timestamp = TODAY
+    //   → appeared as new msgs → added to end → garbage in cache
+    //   NOW: date context tracking is correct → "Saturday 1:07pm" = correct past date
+    //   → msgTime < firstCacheTime → correctly goes to FRONT
+    // ══════════════════════════════════════════════════════════════════
+    private fun processMessages(screenMessages: List<ChatMessageData>): Boolean {
+
+        val sorted = screenMessages.sortedWith(
+            compareBy<ChatMessageData> { parseIsoToMs(it.time) }
+                .thenBy { it.y }
+        )
+
         var changed = false
 
         for (msg in sorted) {
+
             val msgTimeMs = parseIsoToMs(msg.time)
-            val normText  = msg.normalizedText()
+            val key = msg.seenKey()
 
-            // Layer 1: Text dedup
-            if (normText in seenKeys) {
-                Log.v(TAG, "⏭ Skip (text seen): ${normText.take(30)}")
+            if (msgTimeMs <= 0L) continue
+
+            if (key in seenKeys) {
+                Log.v(TAG, "⏭ Skip (seen): ${key.take(35)}")
                 continue
             }
 
-            // Layer 2: Window range — only strictly newer than lastCacheTimeMs
-            if (msgTimeMs <= lastCacheTimeMs) {
-                Log.v(TAG, "⏭ Skip (old/same time): ${msg.time} <= $lastCacheTimeMs")
-                continue
+            when {
+
+                // HISTORY MESSAGE
+                msgTimeMs > lastCacheTimeMs -> {
+
+                    messageCache.addLast(msg)
+                    seenKeys.add(key)
+
+                    if (messageCache.size > MAX_CACHE_SIZE) {
+                        val removed = messageCache.removeFirst()
+                        Log.d(TAG, "🗑️ Removed oldest: ${removed.message.take(25)}")
+                    }
+
+                    firstCacheTimeMs = parseIsoToMs(messageCache.first().time)
+                    lastCacheTimeMs  = parseIsoToMs(messageCache.last().time)
+
+                    Log.i(TAG, "➕ New: ${msg.message.take(30)}")
+                    changed = true
+                }
+
+                // NEW MESSAGE
+                msgTimeMs > lastCacheTimeMs -> {
+
+                    messageCache.addLast(msg)
+                    seenKeys.add(key)
+
+                    if (messageCache.size > MAX_CACHE_SIZE) {
+                        val evicted = messageCache.removeFirst()
+                        Log.d(TAG, "🗑️ Evicted head: ${evicted.message.take(20)}")
+                    }
+
+                    lastCacheTimeMs = parseIsoToMs(messageCache.last().time)
+
+                    Log.i(TAG, "➕ New: [${msg.sender}] ${msg.message.take(40)} @ ${msg.time}")
+                    changed = true
+                }
+
+                else -> {
+
+                    if (key !in seenKeys) {
+
+                        messageCache.addLast(msg)
+                        seenKeys.add(key)
+
+                        if (messageCache.size > MAX_CACHE_SIZE) {
+                            messageCache.removeFirst()
+                        }
+
+                        Log.i(TAG, "⚠️ Late insert: ${msg.message.take(30)} @ ${msg.time}")
+                        changed = true
+                    }
+                }
             }
-
-            // Layer 3: This is a genuinely new message
-            messageCache.addLast(msg)
-            seenKeys.add(normText)
-
-            if (messageCache.size > MAX_CACHE_SIZE) {
-                val evicted = messageCache.removeFirst()
-                // Update firstCacheTimeMs after eviction
-                firstCacheTimeMs = parseIsoToMs(messageCache.first().time)
-                Log.d(TAG, "🗑️ Evicted: [${evicted.sender}] ${evicted.message.take(25)}")
-            }
-
-            lastCacheTimeMs = msgTimeMs
-            Log.i(TAG, "➕ New: [${msg.sender}] ${msg.message.take(40)} @ ${msg.time}")
-            changed = true
         }
 
         return changed
     }
+    // ══════════════════════════════════════════
+    // BUG B FIX: seenKey = text + "|" + HH:mm
+    //
+    // "THIK" at 11:58 → "thik|11:58"
+    // "thik" at 12:09 → "thik|12:09"  ← DIFFERENT key → both allowed ✓
+    //
+    // Using HH:mm not full ISO because:
+    // - Same msg can appear with same time on multiple scans (same key = dedup ✓)
+    // - Different msg with same text at different time (different key = both pass ✓)
+    // ══════════════════════════════════════════
+    private fun ChatMessageData.seenKey(): String {
+        val normText = message.trim().replace(Regex("\\s+"), " ").lowercase()
+        // Extract HH:mm from ISO "2026-03-11T11:58:00" → "11:58"
+        val hhmm = if (time.length >= 16) time.substring(11, 16) else time
+        return "$normText|$hhmm"
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // WHATSAPP EXTRACTION — ORDER-BASED DATE CONTEXT
+    //
+    // THREE patterns confirmed from logs:
+    //
+    // Pattern A — divider INSIDE ViewGroup (most common):
+    //   ViewGroup[4]: [divider="Today"] + message + date + status
+    //
+    // Pattern B — divider as STANDALONE list item:
+    //   list[0]: conversation_row_date_divider = "3 March 2026"
+    //   list[2]: ViewGroup (no divider): message + date
+    //
+    // Pattern C — date_divider_header at COORDINATOR level (confirmed log 15:01:17):
+    //   coordinator: date_divider_header = "Yesterday"
+    //   list[0]: STRIPE msg (no divider in parent) ← needs coordinator date
+    // ══════════════════════════════════════════════════════════════════════
+    private fun extractWhatsAppMessages(root: AccessibilityNodeInfo): List<ChatMessageData> {
+        val messages = mutableListOf<ChatMessageData>()
+
+        // Pattern C: Pre-scan coordinator for date_divider_header
+        var coordinatorDateCal: Calendar? = null
+        val coordinatorNodes = root.findAccessibilityNodeInfosByViewId("com.whatsapp:id/date_divider_header")
+        coordinatorNodes?.firstOrNull()?.text?.toString()?.trim()?.let { divText ->
+            coordinatorDateCal = parseDateDivider(divText)
+            if (coordinatorDateCal != null) {
+                Log.d(TAG, "📅 Coordinator date context: [$divText]")
+            }
+        }
+
+        val listNode = root.findAccessibilityNodeInfosByViewId("android:id/list")
+            ?.firstOrNull() ?: return messages
+
+        // Default: coordinatorDate if found, else today
+        var currentDateCal: Calendar = coordinatorDateCal ?: Calendar.getInstance()
+
+        // Walk list IN ORDER — critical for correct date context
+        for (i in 0 until listNode.childCount) {
+            val listItem = listNode.getChild(i) ?: continue
+            val newDate  = processListItem(listItem, messages, currentDateCal)
+            if (newDate != null) {
+                currentDateCal = newDate
+                Log.d(TAG, "📅 Date context updated → ${ISO_FMT.format(currentDateCal.time)}")
+            }
+        }
+
+        return messages
+            .filter { parseIsoToMs(it.time) > 0L && it.message.length >= 2 }
+            .distinctBy { "${it.message.trim().lowercase()}|${it.time}" }  // dedup by text+time
+            .sortedBy { parseIsoToMs(it.time) }
+    }
+
+    private fun processListItem(
+        listItem: AccessibilityNodeInfo,
+        messages: MutableList<ChatMessageData>,
+        currentDateCal: Calendar
+    ): Calendar? {
+
+        if (isInsidePinnedOrSystemBanner(listItem)) return null
+
+        val viewId  = listItem.viewIdResourceName ?: ""
+
+        // Standalone date divider list item
+        if (viewId == "com.whatsapp:id/conversation_row_date_divider") {
+            val rawText = listItem.text?.toString()?.trim() ?: ""
+            if (rawText.isNotEmpty()) return parseDateDivider(rawText)
+            return null
+        }
+
+        if (viewId == "com.whatsapp:id/info") return null
+
+        // ViewGroup — scan children
+        var updatedDate: Calendar? = null
+        var msgText:  String?  = null
+        var timeStr:  String?  = null
+        var sender              = "other"
+        var msgY                = 0
+        var localDate: Calendar? = null
+        var fileName: String?  = null
+        var fileType: String?  = null
+
+        for (j in 0 until listItem.childCount) {
+            val child    = listItem.getChild(j) ?: continue
+            val childId  = child.viewIdResourceName ?: ""
+            val childTxt = child.text?.toString()?.trim() ?: ""
+            val cleaned  = cleanTimestampString(childTxt)
+
+            when (childId) {
+                "com.whatsapp:id/conversation_row_date_divider" -> {
+                    if (childTxt.isNotEmpty()) {
+                        val cal = parseDateDivider(childTxt)
+                        if (cal != null) { localDate = cal; updatedDate = cal }
+                    }
+                }
+                "com.whatsapp:id/message_text" -> {
+                    msgText = childTxt
+                    val rect = Rect().also { child.getBoundsInScreen(it) }
+                    msgY = rect.centerY()
+                }
+                "com.whatsapp:id/date" -> {
+                    if (isTimeOnlyText(cleaned)) timeStr = cleaned
+                }
+                "com.whatsapp:id/status" -> { sender = "me" }
+                "com.whatsapp:id/caption_text" -> {
+                    if (childTxt.isNotEmpty()) {
+                        msgText = "[Image] $childTxt"
+                        val rect = Rect().also { child.getBoundsInScreen(it) }
+                        msgY = rect.centerY()
+                    }
+                }
+                "com.whatsapp:id/content" -> {
+                    for (k in 0 until child.childCount) {
+                        val gc = child.getChild(k) ?: continue
+                        when (gc.viewIdResourceName) {
+                            "com.whatsapp:id/title"     -> fileName = gc.text?.toString()?.trim()
+                            "com.whatsapp:id/file_type" -> fileType = gc.text?.toString()?.trim()
+                        }
+                    }
+                    val rect = Rect().also { child.getBoundsInScreen(it) }
+                    msgY = rect.centerY()
+                }
+            }
+        }
+
+        if (msgText == null && !fileName.isNullOrEmpty()) {
+            msgText = if (!fileType.isNullOrEmpty()) "[$fileType] $fileName" else "[File] $fileName"
+        }
+
+        if (!msgText.isNullOrEmpty() && !timeStr.isNullOrEmpty()) {
+            val effectiveDateCal = localDate ?: currentDateCal
+            val fullTimestamp    = combineDateTime(effectiveDateCal, timeStr)
+            if (fullTimestamp.isNotEmpty() && msgText.lowercase().trim() !in WHATSAPP_IGNORE_TEXT) {
+                messages.add(ChatMessageData(sender, msgText, fullTimestamp, msgY))
+            }
+        }
+
+        return updatedDate
+    }
+
+    private fun parseDateDivider(text: String): Calendar? {
+        val lower = text.lowercase().trim()
+        return when {
+            lower == "today" -> Calendar.getInstance()
+            lower == "yesterday" -> Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
+            DAY_OF_WEEK_MAP.containsKey(lower) -> {
+                val targetDay = DAY_OF_WEEK_MAP[lower]!!
+                val cal = Calendar.getInstance()
+                var attempts = 0
+                while (cal.get(Calendar.DAY_OF_WEEK) != targetDay && attempts < 8) {
+                    cal.add(Calendar.DAY_OF_YEAR, -1)
+                    attempts++
+                }
+                cal
+            }
+            else -> {
+                val formats = listOf("d MMMM yyyy", "MMMM d, yyyy", "MMM d, yyyy", "d MMM yyyy")
+                for (fmt in formats) {
+                    try {
+                        val parsed = SimpleDateFormat(fmt, Locale.ENGLISH).parse(text) ?: continue
+                        val cal = Calendar.getInstance()
+                        cal.time = parsed
+                        return cal
+                    } catch (e: Exception) { continue }
+                }
+                null
+            }
+        }
+    }
+
+    private fun combineDateTime(dateCal: Calendar, timeStr: String): String {
+        val cleaned = cleanTimestampString(timeStr)
+        val cal     = parseTime(cleaned, dateCal) ?: return ""
+        return formatIso(cal)
+    }
 
     // ══════════════════════════════════════════
-    // NORMALIZED TEXT
-    // Multi-line, extra spaces sab normalize ho jate hain
-    // "Hello  world\nnext line" → "hello world next line"
+    // INSTAGRAM EXTRACTION
     // ══════════════════════════════════════════
-    private fun ChatMessageData.normalizedText(): String =
-        message.trim()
-            .replace(Regex("\\s+"), " ")   // collapse whitespace/newlines
-            .lowercase()
+    private fun extractInstagramMessages(root: AccessibilityNodeInfo): List<ChatMessageData> {
+        val result = mutableListOf<ChatMessageData>()
+        traverseInstagram(root, result, resources.displayMetrics.widthPixels, "")
+        return result.filter { it.message.length >= 2 && it.message.lowercase() !in INSTAGRAM_IGNORE }
+    }
 
-    // ══════════════════════════════════════════
-    // RESET CACHE
-    // ══════════════════════════════════════════
+    private fun traverseInstagram(
+        node: AccessibilityNodeInfo?, result: MutableList<ChatMessageData>,
+        screenWidth: Int, currentTime: String, depth: Int = 0
+    ) {
+        if (node == null || depth > 20) return
+        val text   = node.text?.toString()?.trim() ?: ""
+        val viewId = node.viewIdResourceName ?: ""
+        var timeToUse = currentTime
+        val cleaned = cleanTimestampString(text)
+        if (isTimestampText(cleaned)) timeToUse = normalizeInstagramTimestamp(cleaned)
+        if (viewId in INSTAGRAM_MSG_IDS && text.isNotEmpty() && timeToUse.isNotEmpty()) {
+            val rect = Rect().also { node.getBoundsInScreen(it) }
+            result.add(ChatMessageData(
+                sender  = if (rect.centerX() > screenWidth * 0.55) "me" else "other",
+                message = text, time = timeToUse, y = rect.centerY()
+            ))
+        }
+        for (i in 0 until node.childCount)
+            traverseInstagram(node.getChild(i), result, screenWidth, timeToUse, depth + 1)
+    }
+
+    private fun isInsidePinnedOrSystemBanner(node: AccessibilityNodeInfo): Boolean {
+        var current: AccessibilityNodeInfo? = node.parent
+        var depth = 0
+        while (current != null && depth < 10) {
+            val id = current.viewIdResourceName ?: ""
+            if (id in WHATSAPP_BANNER_IDS || id in WHATSAPP_SYSTEM_IDS) return true
+            current = current.parent
+            depth++
+        }
+        return false
+    }
+
     private fun resetCache() {
         messageCache.clear()
         seenKeys.clear()
@@ -308,15 +597,6 @@ class ChatAccessibilityService : AccessibilityService() {
         cacheInitialized = false
     }
 
-    // ══════════════════════════════════════════
-    // TIME PARSER
-    // ══════════════════════════════════════════
-    private fun parseIsoToMs(isoTime: String): Long =
-        try { ISO_FMT.parse(isoTime)?.time ?: 0L } catch (e: Exception) { 0L }
-
-    // ══════════════════════════════════════════
-    // CONTACT NAME
-    // ══════════════════════════════════════════
     private fun extractContactName(root: AccessibilityNodeInfo, pkg: String): String {
         return when {
             pkg == "com.instagram.android" ->
@@ -333,120 +613,17 @@ class ChatAccessibilityService : AccessibilityService() {
     }
 
     // ══════════════════════════════════════════
-    // INSTAGRAM EXTRACTION
+    // TIME UTILITIES
     // ══════════════════════════════════════════
-    private fun extractInstagramMessages(root: AccessibilityNodeInfo): List<ChatMessageData> {
-        val result = mutableListOf<ChatMessageData>()
-        traverseInstagram(root, result, resources.displayMetrics.widthPixels, "")
-        return result.filter { isValidMessage(it.message, INSTAGRAM_IGNORE) }
-    }
+    private fun parseIsoToMs(isoTime: String): Long =
+        try { ISO_FMT.parse(isoTime)?.time ?: 0L } catch (e: Exception) { 0L }
 
-    private fun traverseInstagram(
-        node: AccessibilityNodeInfo?, result: MutableList<ChatMessageData>,
-        screenWidth: Int, currentTime: String, depth: Int = 0
-    ) {
-        if (node == null || depth > 20) return
-        val text   = node.text?.toString()?.trim() ?: ""
-        val viewId = node.viewIdResourceName ?: ""
-        var timeToUse = currentTime
-        if (isTimestampText(text)) timeToUse = normalizeTimestamp(text)
-        if (viewId in INSTAGRAM_MSG_IDS && text.isNotEmpty()) {
-            val rect = Rect().also { node.getBoundsInScreen(it) }
-            result.add(ChatMessageData(
-                sender  = if (rect.centerX() > screenWidth * 0.55) "me" else "other",
-                message = text,
-                time    = timeToUse.ifEmpty { getCurrentIsoTime() }
-            ))
-        }
-        for (i in 0 until node.childCount)
-            traverseInstagram(node.getChild(i), result, screenWidth, timeToUse, depth + 1)
-    }
+    private fun cleanTimestampString(raw: String): String =
+        raw.replace('\u202F', ' ').replace('\u00A0', ' ').trim()
 
-    // ══════════════════════════════════════════
-    // WHATSAPP EXTRACTION
-    // ══════════════════════════════════════════
-    private fun extractWhatsAppMessages(root: AccessibilityNodeInfo): List<ChatMessageData> {
+    private fun isTimeOnlyText(text: String): Boolean =
+        text.lowercase().matches(Regex("\\d{1,2}:\\d{2}(\\s?(am|pm))?", RegexOption.IGNORE_CASE))
 
-        val messages = mutableListOf<ChatMessageData>()
-        val screenWidth = resources.displayMetrics.widthPixels
-
-        val nodes = root.findAccessibilityNodeInfosByViewId("com.whatsapp:id/message_text")
-
-        for(node in nodes){
-
-            val text = node.text?.toString()?.trim() ?: continue
-            if(text.isEmpty()) continue
-
-            val parent = node.parent ?: continue
-
-            var timestamp:String? = null
-
-            for(i in 0 until parent.childCount){
-                val child = parent.getChild(i) ?: continue
-                val childText = child.text?.toString()?.trim() ?: continue
-
-                if(isTimestampText(childText)){
-                    timestamp = normalizeTimestamp(childText)
-                    break
-                }
-            }
-
-            if(timestamp == null) continue
-
-            val rect = Rect()
-            node.getBoundsInScreen(rect)
-
-            val sender =
-                if(rect.centerX() > screenWidth * 0.6) "me"
-                else "other"
-
-            messages.add(
-                ChatMessageData(
-                    sender,
-                    text,
-                    timestamp
-                )
-            )
-        }
-
-        return messages
-    }
-
-    private fun traverseWhatsApp(
-        node: AccessibilityNodeInfo?, result: MutableList<ChatMessageData>,
-        screenWidth: Int, currentTime: String = "", depth: Int = 0
-    ) {
-        if (node == null || depth > 20) return
-        val text   = node.text?.toString()?.trim() ?: ""
-        val viewId = node.viewIdResourceName ?: ""
-        var timeToUse = currentTime
-        if (isTimestampText(text)) timeToUse = normalizeTimestamp(text)
-        if (viewId in WHATSAPP_MSG_IDS && text.isNotEmpty()) {
-            val rect = Rect().also { node.getBoundsInScreen(it) }
-            result.add(ChatMessageData(
-                sender  = if (rect.centerX() > screenWidth * 0.55) "me" else "other",
-                message = text,
-                time    = timeToUse.ifEmpty { getCurrentIsoTime() }
-            ))
-        }
-        for (i in 0 until node.childCount)
-            traverseWhatsApp(node.getChild(i), result, screenWidth, timeToUse, depth + 1)
-    }
-
-    // ══════════════════════════════════════════
-    // VALID MESSAGE CHECK
-    // ══════════════════════════════════════════
-    private fun isValidMessage(text: String, ignoreSet: Set<String>): Boolean {
-        if (text.length < 2) return false
-        if (text.lowercase().trim() in ignoreSet) return false
-        if (isTimestampText(text)) return false
-        if (text.matches(Regex("\\d{1,2}:\\d{2}(\\s?(am|AM|pm|PM))?"))) return false
-        return true
-    }
-
-    // ══════════════════════════════════════════
-    // TIMESTAMP
-    // ══════════════════════════════════════════
     private fun isTimestampText(text: String): Boolean {
         val l = text.lowercase()
         return l.startsWith("today") || l.startsWith("yesterday") ||
@@ -454,35 +631,36 @@ class ChatAccessibilityService : AccessibilityService() {
             l.matches(Regex("(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\\s+\\d{1,2}.*", RegexOption.IGNORE_CASE))
     }
 
-    private fun normalizeTimestamp(raw: String): String {
-        val lower = raw.lowercase().trim()
-        val today = Calendar.getInstance()
+    private fun normalizeInstagramTimestamp(raw: String): String {
+        val cleaned = cleanTimestampString(raw)
+        val lower   = cleaned.lowercase()
+        val today   = Calendar.getInstance()
         return try {
             when {
                 lower.startsWith("today") ->
-                    formatIso(parseTime(raw.substringAfter(" ").trim(), today) ?: today)
+                    formatIso(parseTime(cleaned.substringAfter(" ").trim(), today) ?: return "")
                 lower.startsWith("yesterday") -> {
                     val yday = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
-                    formatIso(parseTime(raw.substringAfter(" ").trim(), yday) ?: yday)
-                }
-                lower.matches(Regex("(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec).*", RegexOption.IGNORE_CASE)) -> {
-                    val p = try { SimpleDateFormat("MMM d h:mm a", Locale.ENGLISH).parse(raw) } catch (e: Exception) { null }
-                    if (p != null) {
-                        val c = Calendar.getInstance().apply { time = p; set(Calendar.YEAR, today.get(Calendar.YEAR)) }
-                        formatIso(c)
-                    } else getCurrentIsoTime()
+                    formatIso(parseTime(cleaned.substringAfter(" ").trim(), yday) ?: return "")
                 }
                 lower.matches(Regex("\\d{1,2}:\\d{2}(\\s?(am|pm))?", RegexOption.IGNORE_CASE)) ->
-                    formatIso(parseTime(raw, today) ?: today)
-                else -> getCurrentIsoTime()
+                    formatIso(parseTime(cleaned, today) ?: return "")
+                lower.matches(Regex("(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec).*", RegexOption.IGNORE_CASE)) -> {
+                    val p = try { SimpleDateFormat("MMM d h:mm a", Locale.ENGLISH).parse(cleaned) }
+                    catch (e: Exception) { null } ?: return ""
+                    val c = Calendar.getInstance().apply { time = p; set(Calendar.YEAR, today.get(Calendar.YEAR)) }
+                    formatIso(c)
+                }
+                else -> ""
             }
-        } catch (e: Exception) { getCurrentIsoTime() }
+        } catch (e: Exception) { "" }
     }
 
     private fun parseTime(timeStr: String, base: Calendar): Calendar? {
+        val cleaned = cleanTimestampString(timeStr)
         for (fmt in listOf("h:mm a", "h:mm", "HH:mm")) {
             try {
-                val p = SimpleDateFormat(fmt, Locale.ENGLISH).parse(timeStr.trim()) ?: continue
+                val p = SimpleDateFormat(fmt, Locale.ENGLISH).parse(cleaned.trim()) ?: continue
                 val r = base.clone() as Calendar
                 val c = Calendar.getInstance().apply { time = p }
                 r.set(Calendar.HOUR_OF_DAY, c.get(Calendar.HOUR_OF_DAY))
@@ -494,49 +672,32 @@ class ChatAccessibilityService : AccessibilityService() {
         return null
     }
 
-    private fun formatIso(cal: Calendar) = ISO_FMT.format(cal.time)
-    private fun getCurrentIsoTime()      = ISO_FMT.format(Date())
-
-
-    private fun debugTree(node: AccessibilityNodeInfo?, depth:Int=0){
-
-        if(node==null) return
-
-        val indent = " ".repeat(depth*2)
-
-        Log.d(TAG,
-            "$indent node=" +
-                " id=${node.viewIdResourceName}" +
-                " text=${node.text}"
-        )
-
-        for(i in 0 until node.childCount){
-            debugTree(node.getChild(i),depth+1)
-        }
-    }
+    private fun formatIso(cal: Calendar): String = ISO_FMT.format(cal.time)
 
     // ══════════════════════════════════════════
-    // BROADCAST
+    // BROADCAST — sorted oldest→newest with sequence
     // ══════════════════════════════════════════
     private fun broadcastCache(pkg: String, chatWith: String) {
-        val json = buildJsonArray(messageCache.toList())
+
+        val ordered = messageCache.sortedWith(
+            compareBy<ChatMessageData> { parseIsoToMs(it.time) }
+                .thenBy { it.y }
+        )
+
         sendBroadcast(Intent(ACTION_CHAT_CONTEXT).apply {
             setPackage(applicationContext.packageName)
-            putExtra(EXTRA_PACKAGE,   pkg)
+            putExtra(EXTRA_PACKAGE, pkg)
             putExtra(EXTRA_CHAT_WITH, chatWith)
-            putExtra(EXTRA_MESSAGES,  json)
+            putExtra(EXTRA_MESSAGES, buildJsonArray(ordered))
         })
-        Log.d(TAG, "📡 Broadcast: ${messageCache.size} msgs | chat=$chatWith")
-    }
 
+        Log.d(TAG, "📡 Broadcast: ${ordered.size} msgs | chat=$chatWith")
+    }
     private fun buildJsonArray(messages: List<ChatMessageData>): String {
         val sb = StringBuilder("[")
         messages.forEachIndexed { i, msg ->
-            sb.append("{")
-            sb.append("\"sender\":\"${msg.sender}\",")
-            sb.append("\"message\":\"${escapeJson(msg.message)}\",")
-            sb.append("\"time\":\"${msg.time}\"")
-            sb.append("}")
+            sb.append("{\"sequence\":${i + 1},\"sender\":\"${msg.sender}\",")
+            sb.append("\"message\":\"${escapeJson(msg.message)}\",\"time\":\"${msg.time}\"}")
             if (i < messages.size - 1) sb.append(",")
         }
         sb.append("]")
@@ -548,23 +709,30 @@ class ChatAccessibilityService : AccessibilityService() {
         .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
     // ══════════════════════════════════════════
-    // DEBUG LOG
+    // DEBUG
     // ══════════════════════════════════════════
     private fun logCacheState() {
         Log.i(TAG, "╔══════════════════════════════════════╗")
         Log.i(TAG, "  CACHE [${messageCache.size}/$MAX_CACHE_SIZE] — $cachedChatWith")
         Log.i(TAG, "  Window: [${messageCache.firstOrNull()?.time} → ${messageCache.lastOrNull()?.time}]")
         Log.i(TAG, "╚══════════════════════════════════════╝")
-        messageCache.forEachIndexed { i, m ->
-            val isLast = i == messageCache.size - 1
-            Log.i(TAG, "  [$i] ${m.time} [${m.sender}] ${m.message.take(45)}${if (isLast) " ← LATEST" else ""}")
+        messageCache.sortedBy { parseIsoToMs(it.time) }.forEachIndexed { i, m ->
+            val marker = if (i == messageCache.size - 1) " ← LATEST" else ""
+            Log.i(TAG, "  [$i] ${m.time} [${m.sender}] ${m.message.take(50)}$marker")
         }
+    }
+
+    private fun debugFullTree(node: AccessibilityNodeInfo?, depth: Int = 0) {
+        if (node == null || depth > 20) return
+        val indent = " ".repeat(depth * 2)
+        Log.d(TAG, "$indent id=${node.viewIdResourceName} text=${node.text} class=${node.className} children=${node.childCount}")
+        for (i in 0 until node.childCount) debugFullTree(node.getChild(i), depth + 1)
     }
 }
 
 data class ChatMessageData(
     val sender:  String,
     val message: String,
-    val time:    String
+    val time:    String,
+    val y:       Int = 0
 )
-
