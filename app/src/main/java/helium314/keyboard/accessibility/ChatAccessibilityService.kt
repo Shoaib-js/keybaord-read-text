@@ -295,10 +295,20 @@ class ChatAccessibilityService : AccessibilityService() {
             // Gate 1: must have a parseable timestamp
             if (msgTimeMs <= 0L) continue
 
-            // Gate 2: must be strictly newer than the last cached message.
-            // Rejects ALL visible/scroll-history messages (they are <= lastCacheTimeMs).
-            if (msgTimeMs <= lastCacheTimeMs) {
-                Log.v(TAG, "⏭ Skip (not newer): [${msg.sender}] ${msg.message.take(25)} @ ${msg.time}")
+            // Gate 2: must be same-time OR newer than last cached message.
+            // Only rejects messages that are STRICTLY OLDER (scroll-history / old msgs).
+            //
+            // WHY < instead of <=:
+            //   WhatsApp timestamps are minute-resolution (HH:mm).
+            //   If lastCacheTimeMs = 15:01 and a new msg arrives also at 15:01
+            //   (different sender, or another message in the same minute),
+            //   the old <= gate would SKIP it. That is wrong.
+            //
+            //   Gate 3 (seenKey check) handles same-scan re-deliveries correctly.
+            //   Scroll-history old messages are blocked by Gate 3 because their
+            //   seenKey was already added during initialLoad or earlier scans.
+            if (msgTimeMs < lastCacheTimeMs) {
+                Log.v(TAG, "⏭ Skip (older): [${msg.sender}] ${msg.message.take(25)} @ ${msg.time}")
                 continue
             }
 
@@ -320,6 +330,7 @@ class ChatAccessibilityService : AccessibilityService() {
             lastCacheTimeMs = parseIsoToMs(messageCache.last().time)
 
             Log.i(TAG, "➕ Appended: [${msg.sender}] ${msg.message.take(40)} @ ${msg.time}")
+//            Log.i(TAG, "➕ Appended: [${msg.sender}] ${msg.message} @ ${msg.time}")
             changed = true
         }
 
@@ -335,11 +346,24 @@ class ChatAccessibilityService : AccessibilityService() {
     // - Same msg can appear with same time on multiple scans (same key = dedup ✓)
     // - Different msg with same text at different time (different key = both pass ✓)
     // ══════════════════════════════════════════
+    // seenKey = sender + "|" + normalizedText + "|" + HH:mm
+    //
+    // WHY sender is included (NEW FIX):
+    //   Without sender:  ME "ok" at 15:01  →  key = "ok|15:01"
+    //                   OTHER "ok" at 15:01 →  key = "ok|15:01"  ← COLLISION → 2nd SKIPPED ❌
+    //
+    //   With sender:    OTHER "ok" at 15:01 →  key = "other|ok|15:01" ✓
+    //                   ME    "ok" at 15:01 →  key = "me|ok|15:01"    ✓ (different key!)
+    //
+    // WHY HH:mm (not full ISO):
+    //   Same message re-scanned = same key = dedup ✓
+    //   Same text at different minute = different key = both stored ✓
     private fun ChatMessageData.seenKey(): String {
         val normText = message.trim().replace(Regex("\\s+"), " ").lowercase()
         // Extract HH:mm from ISO "2026-03-11T11:58:00" → "11:58"
         val hhmm = if (time.length >= 16) time.substring(11, 16) else time
-        return "$normText|$hhmm"
+        // Include sender so ME and OTHER can send same text at same time → both stored
+        return "${sender}|$normText|$hhmm"
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -388,8 +412,9 @@ class ChatAccessibilityService : AccessibilityService() {
         }
 
         return messages
-            .filter { parseIsoToMs(it.time) > 0L && it.message.length >= 2 }
-            .distinctBy { "${it.message.trim().lowercase()}|${it.time}" }  // dedup by text+time
+//            .filter { parseIsoToMs(it.time) > 0L && it.message.length >= 2 }
+            .filter { parseIsoToMs(it.time) > 0L && it.message.isNotBlank() }
+//            .distinctBy { "${it.message.trim().lowercase()}|${it.time}" }  // dedup by text+time
             .sortedBy { parseIsoToMs(it.time) }
     }
 

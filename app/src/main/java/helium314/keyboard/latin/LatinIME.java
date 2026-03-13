@@ -98,6 +98,7 @@ import androidx.core.content.ContextCompat;
 
 // AI Chat Suggestion Helper
 import helium314.keyboard.ai.ChatAiSuggestionHelper;
+import helium314.keyboard.chat.ChatBridgeReceiver;
 
 import helium314.keyboard.ai.AiTonePanel;
 
@@ -179,6 +180,7 @@ public class LatinIME extends InputMethodService implements
 
     // ── AI Chat Suggestion Helper ──────────────────────────────────────────
     private ChatAiSuggestionHelper mChatAiHelper;
+    private ChatBridgeReceiver mChatBridgeReceiver;
     private AiTonePanel mAiTonePanel;
     private boolean mIsAiPanelVisible = false;
     // ──────────────────────────────────────────────────────────────────────
@@ -595,6 +597,12 @@ public class LatinIME extends InputMethodService implements
         Log.i(TAG, "ChatAiSuggestionHelper initialized");
         // ──────────────────────────────────────────────────────────────────
 
+        // ── Initialize ChatBridgeReceiver (populates MessageCache.shared) ──
+        mChatBridgeReceiver = new ChatBridgeReceiver();
+        mChatBridgeReceiver.register(this);
+        Log.i(TAG, "ChatBridgeReceiver initialized");
+        // ──────────────────────────────────────────────────────────────────
+
     }
 
     private void loadSettings() {
@@ -686,6 +694,10 @@ public class LatinIME extends InputMethodService implements
         if (mChatAiHelper != null) {
             mChatAiHelper.unregister();
             mChatAiHelper = null;
+        }
+        if (mChatBridgeReceiver != null) {
+            mChatBridgeReceiver.unregister(this);
+            mChatBridgeReceiver = null;
         }
         // ──────────────────────────────────────────────────────────────────
         mClipboardHistoryManager.onDestroy();
