@@ -74,7 +74,7 @@ class ChatAccessibilityService : AccessibilityService() {
             "com.instagram.android"
         )
 
-        private const val DEBOUNCE_MS = 1500L
+        private const val DEBOUNCE_MS = 500L
 
         const val ACTION_CHAT_CONTEXT = "helium314.keyboard.CHAT_CONTEXT"
         const val EXTRA_MESSAGES      = "chat_messages_json"
@@ -138,8 +138,7 @@ class ChatAccessibilityService : AccessibilityService() {
     // ArrayDeque: index 0 = oldest, last = newest
     // ══════════════════════════════════════════
     private val messageCache     = ArrayDeque<ChatMessageData>()
-    private val seenKeys         = LinkedHashSet<String>()  // "normalizedText|HH:mm" — Bug B fix
-    private var firstCacheTimeMs = Long.MAX_VALUE
+    private val seenKeys         = LinkedHashSet<String>()
     private var lastCacheTimeMs  = 0L
     private var cachedPackage    = ""
     private var cachedChatWith   = ""
@@ -154,10 +153,11 @@ class ChatAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         val info = AccessibilityServiceInfo().apply {
+            // TYPE_VIEW_SCROLLED intentionally NOT registered.
+            // Scroll must never trigger message collection or debounce resets.
             eventTypes =
                 AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
-                    AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED   or
-                    AccessibilityEvent.TYPE_VIEW_SCROLLED
+                    AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags =
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
@@ -253,7 +253,6 @@ class ChatAccessibilityService : AccessibilityService() {
             seenKeys.add(msg.seenKey())
         }
 
-        firstCacheTimeMs = parseIsoToMs(messageCache.first().time)
         lastCacheTimeMs  = parseIsoToMs(messageCache.last().time)
 
         cacheInitialized = true
@@ -262,21 +261,22 @@ class ChatAccessibilityService : AccessibilityService() {
         return true
     }
     // ══════════════════════════════════════════════════════════════════
-    // PROCESS MESSAGES — BOTH directions
+    // PROCESS MESSAGES — Append-only after initial load
     //
-    // BUG A FIX: addFirst() restored for OLDER messages (scroll history)
-    // BUG B FIX: seenKey = normalizedText + "|" + HH:mm (handles same-text msgs)
+    // RULE: Only one accepted path →
+    //   msgTimeMs > lastCacheTimeMs  AND  key not in seenKeys → addLast()
     //
-    // THREE CASES:
-    //   1. msgTime < firstCacheTime → OLDER (scroll up) → addFirst()
-    //   2. msgTime > lastCacheTime  → NEWER (new arrival) → addLast()
-    //   3. msgTime in range         → already cached → SKIP
+    // Everything else is SKIPPED:
+    //   • msgTimeMs <= 0              → invalid timestamp, skip
+    //   • key already in seenKeys    → same instance already captured, skip
+    //   • msgTimeMs <= lastCacheTimeMs → older or same-time msg (includes all
+    //                                    visible/scroll history), skip
     //
-    // WHY addFirst is now SAFE:
-    //   Previous problem: "Saturday" msgs had WRONG timestamp = TODAY
-    //   → appeared as new msgs → added to end → garbage in cache
-    //   NOW: date context tracking is correct → "Saturday 1:07pm" = correct past date
-    //   → msgTime < firstCacheTime → correctly goes to FRONT
+    // This single gate naturally prevents scroll-revealed old messages from
+    // being inserted, because they always have timestamps <= lastCacheTimeMs.
+    //
+    // NOTE: Two messages at the exact same second → only the first is stored.
+    // WhatsApp timestamps are minute-resolution, so this edge case is rare.
     // ══════════════════════════════════════════════════════════════════
     private fun processMessages(screenMessages: List<ChatMessageData>): Boolean {
 
@@ -290,68 +290,37 @@ class ChatAccessibilityService : AccessibilityService() {
         for (msg in sorted) {
 
             val msgTimeMs = parseIsoToMs(msg.time)
-            val key = msg.seenKey()
+            val key       = msg.seenKey()
 
+            // Gate 1: must have a parseable timestamp
             if (msgTimeMs <= 0L) continue
 
-            if (key in seenKeys) {
-                Log.v(TAG, "⏭ Skip (seen): ${key.take(35)}")
+            // Gate 2: must be strictly newer than the last cached message.
+            // Rejects ALL visible/scroll-history messages (they are <= lastCacheTimeMs).
+            if (msgTimeMs <= lastCacheTimeMs) {
+                Log.v(TAG, "⏭ Skip (not newer): [${msg.sender}] ${msg.message.take(25)} @ ${msg.time}")
                 continue
             }
 
-            when {
-
-                // HISTORY MESSAGE
-                msgTimeMs > lastCacheTimeMs -> {
-
-                    messageCache.addLast(msg)
-                    seenKeys.add(key)
-
-                    if (messageCache.size > MAX_CACHE_SIZE) {
-                        val removed = messageCache.removeFirst()
-                        Log.d(TAG, "🗑️ Removed oldest: ${removed.message.take(25)}")
-                    }
-
-                    firstCacheTimeMs = parseIsoToMs(messageCache.first().time)
-                    lastCacheTimeMs  = parseIsoToMs(messageCache.last().time)
-
-                    Log.i(TAG, "➕ New: ${msg.message.take(30)}")
-                    changed = true
-                }
-
-                // NEW MESSAGE
-                msgTimeMs > lastCacheTimeMs -> {
-
-                    messageCache.addLast(msg)
-                    seenKeys.add(key)
-
-                    if (messageCache.size > MAX_CACHE_SIZE) {
-                        val evicted = messageCache.removeFirst()
-                        Log.d(TAG, "🗑️ Evicted head: ${evicted.message.take(20)}")
-                    }
-
-                    lastCacheTimeMs = parseIsoToMs(messageCache.last().time)
-
-                    Log.i(TAG, "➕ New: [${msg.sender}] ${msg.message.take(40)} @ ${msg.time}")
-                    changed = true
-                }
-
-                else -> {
-
-                    if (key !in seenKeys) {
-
-                        messageCache.addLast(msg)
-                        seenKeys.add(key)
-
-                        if (messageCache.size > MAX_CACHE_SIZE) {
-                            messageCache.removeFirst()
-                        }
-
-                        Log.i(TAG, "⚠️ Late insert: ${msg.message.take(30)} @ ${msg.time}")
-                        changed = true
-                    }
-                }
+            // Gate 3: same message instance not already in cache
+            if (key in seenKeys) {
+                Log.v(TAG, "⏭ Skip (seen): ${key.take(40)}")
+                continue
             }
+
+            // All gates passed → this is a genuinely new message → append
+            messageCache.addLast(msg)
+            seenKeys.add(key)
+
+            if (messageCache.size > MAX_CACHE_SIZE) {
+                val evicted = messageCache.removeFirst()
+                Log.d(TAG, "🗑️ Evicted: ${evicted.message.take(25)}")
+            }
+
+            lastCacheTimeMs = parseIsoToMs(messageCache.last().time)
+
+            Log.i(TAG, "➕ Appended: [${msg.sender}] ${msg.message.take(40)} @ ${msg.time}")
+            changed = true
         }
 
         return changed
@@ -592,7 +561,6 @@ class ChatAccessibilityService : AccessibilityService() {
     private fun resetCache() {
         messageCache.clear()
         seenKeys.clear()
-        firstCacheTimeMs = Long.MAX_VALUE
         lastCacheTimeMs  = 0L
         cacheInitialized = false
     }
