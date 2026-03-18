@@ -360,6 +360,16 @@ public final class InputLogic {
         // the risk of calling commitCompletion twice because we don't know how the app
         // will react.
         if (suggestionInfo.isKindOf(SuggestedWordInfo.KIND_APP_DEFINED)) {
+            if (suggestionInfo.mApplicationSpecifiedCompletionInfo == null) {
+                // ✅ AI suggestion — text insert karo, suggestions cleared mat karo
+                // Taaki user baar baar tap kar sake
+                resetComposingState(true /* alsoResetLastComposedWord */);
+                mConnection.commitText(suggestion, 1);
+                mConnection.endBatchEdit();
+                inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW);
+                return inputTransaction;
+            }
+            // Original behavior: app-defined autocomplete (e.g. from browser/app dropdown)
             mSuggestedWords = SuggestedWords.getEmptyInstance();
             mSuggestionStripViewAccessor.setNeutralSuggestionStrip();
             inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW);

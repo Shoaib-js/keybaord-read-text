@@ -25,6 +25,7 @@ import android.view.View.OnLongClickListener
 import android.view.ViewGroup
 import android.view.accessibility.AccessibilityEvent
 import android.widget.ImageButton
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.RelativeLayout
 import android.widget.TextView
@@ -65,6 +66,8 @@ import kotlin.math.min
 
 import helium314.keyboard.ai.AiTonePanel
 import helium314.keyboard.latin.LatinIME
+import android.widget.HorizontalScrollView
+import android.widget.ScrollView
 @SuppressLint("InflateParams")
 class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int) :
     RelativeLayout(context, attrs, defStyle), View.OnClickListener, OnLongClickListener, OnSharedPreferenceChangeListener {
@@ -119,6 +122,9 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
     private val pinnedKeys: ViewGroup = findViewById(R.id.pinned_keys)
     private val suggestionsStrip: ViewGroup = findViewById(R.id.suggestions_strip)
     private val toolbarExpandKey = findViewById<ImageButton>(R.id.suggestions_strip_toolbar_key)
+    // Overlay fix — these two control tone panel without changing IME height
+    private val stripWrapper: ViewGroup = findViewById(R.id.suggestions_strip_wrapper)
+    private val aiTonePanelSlot: FrameLayout = findViewById(R.id.ai_tone_panel_slot)
 
     // ── AI Tone Panel ──
     private var aiTonePanel: AiTonePanel? = null
@@ -230,7 +236,7 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
         }
 
         if (Settings.getValues().mSplitToolbar) {
-             // Ensure Expand Key is visible (actually handled in updateKeys now)
+            // Ensure Expand Key is visible (actually handled in updateKeys now)
         }
 
         layoutHelper = SuggestionStripLayoutHelper(context, attrs, defStyle, wordViews, dividerViews, debugInfoViews)
@@ -335,6 +341,20 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
     }
 
     fun setSuggestions(suggestions: SuggestedWords, isRtlLanguage: Boolean) {
+        // ── AI MODE: custom scrollable chip layout ──────────────────────────
+        val isAiMode = !suggestions.isEmpty() &&
+            suggestions.mInputStyle == SuggestedWords.INPUT_STYLE_APPLICATION_SPECIFIED &&
+            (0 until suggestions.size()).all {
+                val info = suggestions.getInfo(it)
+                info.isKindOf(SuggestedWords.SuggestedWordInfo.KIND_APP_DEFINED) &&
+                    info.mApplicationSpecifiedCompletionInfo == null
+            }
+
+        if (isAiMode) {
+            setAiSuggestionsCustomLayout(suggestions)
+            return
+        }
+        // ───────────────────────────────────────────────────────────────────
         clear()
         setRtl(isRtlLanguage)
         suggestedWords = suggestions
@@ -344,6 +364,104 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
         isExternalSuggestionVisible = false
         updateKeys()
         updateSplitToolbarState()
+    }
+
+    /** AI suggestions ke liye scrollable horizontal chip layout */
+    private fun setAiSuggestionsCustomLayout(suggestions: SuggestedWords) {
+        suggestionsStrip.removeAllViews()
+
+        val colors = Settings.getValues().mColors
+
+        // Outer HorizontalScrollView — scroll karo agar chips zyada lambe hain
+        val hScroll = HorizontalScrollView(context).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.MATCH_PARENT
+            )
+            isHorizontalScrollBarEnabled = false
+            isFillViewport = false
+        }
+
+        // Inner LinearLayout — horizontal, chips side by side
+        val chipRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.MATCH_PARENT
+            )
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+
+        val dp = resources.displayMetrics.density
+        val dp6  = (6  * dp).toInt()
+        val dp12 = (12 * dp).toInt()
+        val dp14 = (14 * dp).toInt()
+        val dp3  = (3  * dp).toInt()
+
+        for (i in 0 until suggestions.size()) {
+            val info = suggestions.getInfo(i)
+            val word = info.mWord.toString()
+
+            // Theme-aware chip background
+            val bgColor = colors.get(ColorType.KEY_BACKGROUND)
+            val textColor = colors.get(ColorType.KEY_TEXT)
+            val accentColor = colors.get(ColorType.ACTION_KEY_BACKGROUND)
+
+            val bg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp14.toFloat()
+                setColor(bgColor)
+                setStroke(2, accentColor)
+            }
+
+            val chip = TextView(context).apply {
+                text = word
+                setTextColor(textColor)
+                textSize = 13f
+                setPadding(dp12, dp6, dp12, dp6)
+                background = bg
+                maxLines = 2
+                isSingleLine = false
+                ellipsize = null
+                gravity = android.view.Gravity.CENTER
+                val chipParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+                chipParams.setMargins(dp6, dp3, dp6, dp3)
+                layoutParams = chipParams
+            }
+
+            // Tap → select suggestion
+            chip.setOnClickListener {
+                // Visual feedback — darken briefly
+                chip.alpha = 0.6f
+                chip.postDelayed({ chip.alpha = 1f }, 120)
+                listener.pickSuggestionManually(info)
+            }
+            chip.setOnLongClickListener {
+                listener.pickSuggestionManually(info)
+                true
+            }
+
+            chipRow.addView(chip)
+
+            // Chip ke beech divider (last ke baad nahi)
+            if (i < suggestions.size() - 1) {
+                val divider = android.view.View(context).apply {
+                    val divParams = LinearLayout.LayoutParams(1, (suggestionsStrip.height * 0.6f).toInt().coerceAtLeast(dp14))
+                    divParams.setMargins(dp3, dp6, dp3, dp6)
+                    layoutParams = divParams
+                    setBackgroundColor(colors.get(ColorType.KEY_TEXT) and 0x40FFFFFF.toInt())
+                }
+                chipRow.addView(divider)
+            }
+        }
+
+        hScroll.addView(chipRow)
+        suggestionsStrip.addView(hScroll)
+        isExternalSuggestionVisible = false
+        Log.d(TAG, "🤖 AI_STRIP: setAiSuggestionsCustomLayout done, chips=${suggestions.size()}")
     }
 
     fun setExternalSuggestionView(view: View?, addCloseButton: Boolean) {
@@ -636,7 +754,7 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
         }
         if (!moreSuggestionsView.show(
                 suggestedWords, startIndexOfMoreSuggestions, moreSuggestionsContainer, layoutHelper, this
-        ))
+            ))
             return false
         for (i in 0..<startIndexOfMoreSuggestions) {
             wordViews[i].isPressed = false
@@ -810,44 +928,44 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
         } else {
             // No suggestions, show random placeholder suggestions
             if (placeholder == null) {
-                 val placeholderContainer = LinearLayout(context)
-                 placeholderContainer.tag = PLACEHOLDER_TAG
-                 placeholderContainer.orientation = LinearLayout.HORIZONTAL
-                 placeholderContainer.layoutParams = LinearLayout.LayoutParams(
-                     LinearLayout.LayoutParams.MATCH_PARENT,
-                     LinearLayout.LayoutParams.MATCH_PARENT
-                 )
+                val placeholderContainer = LinearLayout(context)
+                placeholderContainer.tag = PLACEHOLDER_TAG
+                placeholderContainer.orientation = LinearLayout.HORIZONTAL
+                placeholderContainer.layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.MATCH_PARENT
+                )
 
-                 // Random suggestion words to display
-                 val randomSuggestions = listOf(
-                     "the", "and", "for", "you", "with",
-                     "have", "this", "from", "will", "can",
-                     "hello", "thanks", "please", "okay", "good"
-                 ).shuffled().take(5)
+                // Random suggestion words to display
+                val randomSuggestions = listOf(
+                    "the", "and", "for", "you", "with",
+                    "have", "this", "from", "will", "can",
+                    "hello", "thanks", "please", "okay", "good"
+                ).shuffled().take(5)
 
-                 val colors = Settings.getValues().mColors
-                 val customTypeface = Settings.getInstance().customTypeface
+                val colors = Settings.getValues().mColors
+                val customTypeface = Settings.getInstance().customTypeface
 
-                 randomSuggestions.forEach { word ->
-                     val suggestionView = TextView(context, null, R.attr.suggestionWordStyle)
-                     suggestionView.text = word
-                     suggestionView.gravity = android.view.Gravity.CENTER
-                     suggestionView.alpha = 0.4f // More transparent to indicate they're placeholders
-                     if (customTypeface != null)
-                         suggestionView.typeface = customTypeface
-                     colors.setBackground(suggestionView, ColorType.STRIP_BACKGROUND)
-                     suggestionView.setTextColor(colors.get(ColorType.KEY_TEXT))
+                randomSuggestions.forEach { word ->
+                    val suggestionView = TextView(context, null, R.attr.suggestionWordStyle)
+                    suggestionView.text = word
+                    suggestionView.gravity = android.view.Gravity.CENTER
+                    suggestionView.alpha = 0.4f // More transparent to indicate they're placeholders
+                    if (customTypeface != null)
+                        suggestionView.typeface = customTypeface
+                    colors.setBackground(suggestionView, ColorType.STRIP_BACKGROUND)
+                    suggestionView.setTextColor(colors.get(ColorType.KEY_TEXT))
 
-                     val params = LinearLayout.LayoutParams(
-                         0,
-                         LinearLayout.LayoutParams.MATCH_PARENT,
-                         1f
-                     )
-                     suggestionView.layoutParams = params
-                     placeholderContainer.addView(suggestionView)
-                 }
+                    val params = LinearLayout.LayoutParams(
+                        0,
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        1f
+                    )
+                    suggestionView.layoutParams = params
+                    placeholderContainer.addView(suggestionView)
+                }
 
-                 suggestionsStrip.addView(placeholderContainer)
+                suggestionsStrip.addView(placeholderContainer)
             }
         }
     }
@@ -931,62 +1049,63 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
 
 
     private fun handleAiButtonClick() {
-        if (isAiPanelShowing) {
-            hideAiTonePanel()
-        } else {
-            showAiTonePanel()
-        }
+        if (isAiPanelShowing) hideAiTonePanel() else showAiTonePanel()
     }
 
-
     private fun showAiTonePanel() {
-
+        // OVERLAY FIX: AiTonePanel lives in aiTonePanelSlot (inside this view).
+        // No add/remove to parent → IME window height never changes.
+        // Previously: this.visibility=INVISIBLE + parent.addView() caused
+        // parent height 113→226, Instagram locked to 226, chips were clipped.
         if (aiTonePanel == null) {
             aiTonePanel = AiTonePanel(context).apply {
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                )
                 onToneSelected = { tone ->
                     val latinIME = context as? LatinIME
                         ?: (context as? android.content.ContextWrapper)?.baseContext as? LatinIME
-
                     latinIME?.onAiToneSelected(tone)
                 }
             }
+            aiTonePanelSlot.addView(aiTonePanel)
         }
 
-        this.visibility = INVISIBLE
-
-        val parent = this.parent as? ViewGroup
-
-        parent?.let { p ->
-            if (aiTonePanel?.parent != null) {
-                (aiTonePanel?.parent as? ViewGroup)?.removeView(aiTonePanel)
-            }
-
-            val params = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                this.height
-            )
-
-            p.addView(aiTonePanel, params)
-            aiTonePanel?.visibility = VISIBLE
-            aiTonePanel?.reset()
-        }
+        // Show overlay on top, hide strip content behind it
+        aiTonePanelSlot.visibility = VISIBLE
+        aiTonePanel?.visibility = VISIBLE
+        aiTonePanel?.reset()
+        stripWrapper.visibility = INVISIBLE  // INVISIBLE keeps height, GONE would collapse
 
         isAiPanelShowing = true
+        Log.d(TAG, "🎨 showAiTonePanel: overlay VISIBLE")
     }
 
     fun hideAiTonePanel() {
-        aiTonePanel?.let { panel ->
-            (panel.parent as? ViewGroup)?.removeView(panel)
-        }
-
+        aiTonePanelSlot.visibility = GONE
+        aiTonePanel?.visibility = GONE
+        stripWrapper.visibility = VISIBLE
         this.visibility = VISIBLE
         isAiPanelShowing = false
+        Log.d(TAG, "🎨 hideAiTonePanel: overlay GONE, strip VISIBLE")
     }
-
 
     fun showAiSuggestionsReady() {
-        hideAiTonePanel()
-    }
+        // Hide overlay (GONE, no add/remove, height unchanged)
+        aiTonePanelSlot.visibility = GONE
+        aiTonePanel?.visibility = GONE
+        isAiPanelShowing = false
 
+        // Make strip fully visible
+        this.visibility = VISIBLE
+        stripWrapper.visibility = VISIBLE
+        suggestionsStrip.visibility = VISIBLE
+
+        // Hide toolbar so chips get full width
+        setToolbarVisibility(false)
+
+        Log.d(TAG, "🤖 AI_STRIP: showAiSuggestionsReady → strip VISIBLE, overlay GONE, childCount=${suggestionsStrip.childCount}")
+    }
 
 }

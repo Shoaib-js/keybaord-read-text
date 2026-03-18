@@ -52,6 +52,8 @@ class ChatAiSuggestionHelper(
     private var lastMessagesJson: String = "[]"
     private var lastPackageName: String  = ""
     private var lastChatWith: String     = ""
+    // Fix E — chat key: prevents sending stale data if user switches chats before tapping tone
+    private var lastChatKey: String      = ""
 
     // ════════════════════════════════════════
     // BROADCAST RECEIVER — AccessibilityService se messages receive karo
@@ -68,6 +70,7 @@ class ChatAiSuggestionHelper(
             lastMessagesJson = messagesJson
             lastPackageName  = pkg
             lastChatWith     = chatWith
+            lastChatKey      = "$pkg:$chatWith"   // Fix E — track which chat this data belongs to
 
             Log.d(TAG, "📩 Context received: app=$pkg | chat_with=$chatWith")
         }
@@ -110,12 +113,24 @@ class ChatAiSuggestionHelper(
             else -> lastPackageName
         }
 
-        Log.d(TAG, "🚀 Requesting suggestions | app=$appName | tone=$tone | chat_with=$lastChatWith")
+        // Fix E — snapshot current chat key; validate in coroutine before sending
+        val requestChatKey   = lastChatKey
+        val requestMessages  = lastMessagesJson
+        val requestChatWith  = lastChatWith
+
+        Log.d(TAG, "🚀 Requesting suggestions | app=$appName | tone=$tone | chat_with=$requestChatWith")
 
         scope.launch {
             try {
+                // Fix E — if chat changed between tap and coroutine start, abort
+                if (requestChatKey != lastChatKey) {
+                    Log.w(TAG, "⚠️ Stale context: $requestChatKey vs $lastChatKey — aborting")
+                    onError("Chat badal gaya — dobara try karo.")
+                    return@launch
+                }
+
                 // JSON payload build karo
-                val payload = buildPayload(appName, lastChatWith, tone, lastMessagesJson)
+                val payload = buildPayload(appName, requestChatWith, tone, requestMessages)
                 Log.d(TAG, "📤 Payload: $payload")
 
                 // Backend ko bhejo
@@ -236,6 +251,7 @@ class ChatAiSuggestionHelper(
         lastMessagesJson = "[]"
         lastPackageName  = ""
         lastChatWith     = ""
+        lastChatKey      = ""
         Log.d(TAG, "Context cleared")
     }
 

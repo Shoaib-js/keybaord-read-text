@@ -180,6 +180,16 @@ public class LatinIME extends InputMethodService implements
 
     // ── AI Chat Suggestion Helper ──────────────────────────────────────────
     private ChatAiSuggestionHelper mChatAiHelper;
+    // AI suggestions guard — jab set hai, koi bhi setSuggestedWords call inhe overwrite nahi kar sakta
+    private SuggestedWords mAiSuggestedWords = null;
+    // Active AI state ka source package (mAiSuggestedWords ke saath hamesha set/clear hota hai)
+    // Cross-app stale guard ke liye use hota hai — even after pending has been applied.
+    private String mAiPackageName = null;
+    // Pending AI suggestions — Instagram mein keyboard dismiss ho sakta hai jab API response aata hai.
+    // Response ko yahan store karo, onStartInputView mein re-apply karo.
+    private SuggestedWords mPendingAiSuggestions = null;
+    // Pending ke saath source package store karo — taaki wrong app pe apply na ho.
+    private String mPendingAiPackageName = null;
     private ChatBridgeReceiver mChatBridgeReceiver;
     private AiTonePanel mAiTonePanel;
     private boolean mIsAiPanelVisible = false;
@@ -569,7 +579,7 @@ public class LatinIME extends InputMethodService implements
         StatsUtils.onCreate(mSettings.getCurrent(), mRichImm);
 
         // ── Initialize ChatAiSuggestionHelper ──────────────────────────────
-        String backendUrl = "https://your-backend-server.com/generate-reply";
+        String backendUrl = "https://aisuggestionbackend.tcqstaging.space/api/reply/suggest";
         // TODO: Upar wali line mein apna actual backend URL daalo
 
         mChatAiHelper = new ChatAiSuggestionHelper(
@@ -835,6 +845,73 @@ public class LatinIME extends InputMethodService implements
     void onStartInputViewInternal(final EditorInfo editorInfo, final boolean restarting) {
         super.onStartInputView(editorInfo, restarting);
 
+        // ── Jab WhatsApp Send karo → input restart hota hai (restarting=true, cursor=0)
+        // Ye AI mode clear karta hai taaki agle suggestion fresh aaye ──
+        if (restarting && mAiSuggestedWords != null) {
+            Log.d(TAG, "🤖 AI_GUARD: input restarting after send → clearing AI mode");
+            mAiSuggestedWords     = null;
+            mAiPackageName        = null;
+            mPendingAiSuggestions = null;
+            mPendingAiPackageName = null;
+        }
+
+        // ── Pending AI suggestions (Instagram fix) ────────────────────────
+        // Instagram dismisses the keyboard while the API call is in flight.
+        // When the keyboard re-opens (onStartInputView fires), we apply the
+        // stored suggestions so they appear immediately on the suggestion strip.
+        //
+        // Package guard: if user switched apps, discard pending AND clear the
+        // AI guard — otherwise WhatsApp would show Instagram's suggestions.
+        if (!restarting) {
+            final String currentPkg = (editorInfo != null) ? editorInfo.packageName : null;
+
+            // ── Case 1: cross-app switch while AI mode was active ──────────
+            // mAiPackageName tracks the app that owns the current mAiSuggestedWords.
+            // If it changed (e.g., WhatsApp → Instagram), wipe AI state completely
+            // so the strip can show a clean state for the new app.
+            if (mAiSuggestedWords != null
+                && mAiPackageName != null
+                && !mAiPackageName.equals(currentPkg)) {
+                Log.d(TAG, "🤖 AI_GUARD: app switched (" + mAiPackageName
+                    + " → " + currentPkg + ") → clearing stale AI mode");
+                mAiSuggestedWords     = null;
+                mAiPackageName        = null;
+                mPendingAiSuggestions = null;
+                mPendingAiPackageName = null;
+            }
+
+            // ── Case 2: apply pending suggestions ─────────────────────────
+            if (mPendingAiSuggestions != null) {
+                if (mPendingAiPackageName != null && !mPendingAiPackageName.equals(currentPkg)) {
+                    // Wrong app — discard
+                    Log.d(TAG, "🤖 AI_PENDING: package changed (" + mPendingAiPackageName
+                        + " → " + currentPkg + ") → discarding pending");
+                    mPendingAiSuggestions = null;
+                    mPendingAiPackageName = null;
+                    mAiSuggestedWords     = null;
+                    mAiPackageName        = null;
+                } else {
+                    // Same app — apply pending
+                    final SuggestedWords pending = mPendingAiSuggestions;
+                    final String pendingPkg = mPendingAiPackageName;
+                    mPendingAiSuggestions = null;
+                    mPendingAiPackageName = null;
+                    // Delay one frame so the strip is fully laid out before we draw chips
+                    mHandler.post(() -> {
+                        Log.d(TAG, "🤖 AI_PENDING: applying stored suggestions count=" + pending.size());
+                        mAiSuggestedWords = pending;
+                        mAiPackageName    = pendingPkg;
+                        mHandler.cancelUpdateSuggestionStrip();
+                        // Fix D: setSuggestedWords FIRST (draws chips), THEN show strip (no flicker)
+                        setSuggestedWords(pending);
+                        if (mSuggestionStripView != null) {
+                            mSuggestionStripView.showAiSuggestionsReady();
+                        }
+                    });
+                }
+            }
+        }
+
         mDictionaryFacilitator.onStartInput();
         mGestureConsumer = GestureConsumer.NULL_GESTURE_CONSUMER;
         mRichImm.refreshSubtypeCaches();
@@ -998,6 +1075,21 @@ public class LatinIME extends InputMethodService implements
                 + ", nss=" + newSelStart + ", nse=" + newSelEnd
                 + ", cs=" + composingSpanStart + ", ce=" + composingSpanEnd);
         }
+
+        // ── AI MODE: Send ke baad field empty hoti hai (nss=0, nse=0, cs=-1, ce=-1)
+        // Iska matlab user ne message send kiya → AI mode clear karo
+        if (mAiSuggestedWords != null
+            && newSelStart == 0 && newSelEnd == 0
+            && composingSpanStart == -1 && composingSpanEnd == -1
+            && oldSelStart > 0) {
+            Log.d(TAG, "🤖 AI_GUARD: field cleared after send → clearing AI mode");
+            mAiSuggestedWords     = null;
+            mAiPackageName        = null;
+            mPendingAiSuggestions = null;
+            mPendingAiPackageName = null;
+        }
+        // ──────────────────────────────────────────────────────────────────────
+
         final SettingsValues settingsValues = mSettings.getCurrent();
         if (isInputViewShown()
             && mInputLogic.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd,
@@ -1190,6 +1282,12 @@ public class LatinIME extends InputMethodService implements
         if (Settings.getValues().mSuggestionStripHiddenPerUserSettings) {
             return false;
         }
+        // AI mode active hai to inline autofill suggestions ko ignore karo —
+        // warna setExternalSuggestionView → clear() se AI chips wipe ho jaate hain.
+        if (mAiSuggestedWords != null) {
+            Log.d(TAG, "🤖 AI_GUARD: onInlineSuggestionsResponse blocked (AI mode active)");
+            return false;
+        }
         final List<InlineSuggestion> inlineSuggestions = response.getInlineSuggestions();
         if (inlineSuggestions.isEmpty()) {
             return false;
@@ -1329,6 +1427,23 @@ public class LatinIME extends InputMethodService implements
     }
 
     private void setSuggestedWords(final SuggestedWords suggestedWords) {
+        // ── AI MODE GUARD ──────────────────────────────────────────────
+        if (mAiSuggestedWords != null && suggestedWords != mAiSuggestedWords) {
+            final boolean isUserTyping =
+                suggestedWords.mInputStyle == SuggestedWords.INPUT_STYLE_TYPING ||
+                    suggestedWords.mInputStyle == SuggestedWords.INPUT_STYLE_TAIL_BATCH;
+            if (!isUserTyping) {
+                // Cursor move / autocorrect / background update — AI suggestions protect karo
+                Log.d(TAG, "🤖 AI_GUARD: blocking incoming style=" + suggestedWords.mInputStyle + ", keeping AI suggestions");
+                return;
+            } else {
+                // User type kar raha hai — AI mode exit karo
+                Log.d(TAG, "🤖 AI_GUARD: user typing, exiting AI mode");
+                mAiSuggestedWords = null;
+                mAiPackageName    = null;
+            }
+        }
+        // ────────────────────────────────────────────────────────────────
         final SettingsValues currentSettingsValues = mSettings.getCurrent();
         mInputLogic.setSuggestedWords(suggestedWords);
         if (!hasSuggestionStripView()) {
@@ -1337,6 +1452,16 @@ public class LatinIME extends InputMethodService implements
         if (!onEvaluateInputViewShown()) {
             return;
         }
+        // ── AI MODE: bypass suggestion gate ───────────────────────────────
+        // AI chips must show regardless of whether suggestions are enabled
+        // in user settings. The gate below silently skips setSuggestions()
+        // when suggestions are off, causing a blank strip after API response.
+        if (suggestedWords == mAiSuggestedWords) {
+            mSuggestionStripView.setSuggestions(suggestedWords,
+                mRichImm.getCurrentSubtype().isRtlSubtype());
+            return;
+        }
+        // ─────────────────────────────────────────────────────────────────
         final boolean isEmptyApplicationSpecifiedCompletions = currentSettingsValues
             .isApplicationSpecifiedCompletionsOn()
             && suggestedWords.isEmpty();
@@ -1394,6 +1519,11 @@ public class LatinIME extends InputMethodService implements
 
     @Override
     public void setNeutralSuggestionStrip() {
+        // ── AI MODE GUARD ──
+        if (mAiSuggestedWords != null) {
+            Log.d(TAG, "🤖 AI_GUARD: setNeutralSuggestionStrip blocked (AI mode active)");
+            return;
+        }
         final SettingsValues currentSettings = mSettings.getCurrent();
         if (tryShowClipboardSuggestion()) {
             if (hasSuggestionStripView() && currentSettings.mAutoHideToolbar)
@@ -1646,18 +1776,32 @@ public class LatinIME extends InputMethodService implements
         }
 
         final SuggestedWords suggestedWords = new SuggestedWords(
-            wordInfoList,
-            null,
-            null,
-            false,
-            false,
-            false,
+            wordInfoList, null, null, false, false, false,
             SuggestedWords.INPUT_STYLE_APPLICATION_SPECIFIED,
             SuggestedWords.NOT_A_SEQUENCE_NUMBER
         );
 
+        // Capture source package for cross-app guard
+        final String sourcePkg = (getCurrentInputEditorInfo() != null)
+            ? getCurrentInputEditorInfo().packageName : null;
+
+        // Store pending so suggestions survive Instagram keyboard dismiss
+        mPendingAiSuggestions = suggestedWords;
+        mPendingAiPackageName = sourcePkg;
+
+        // Activate guard BEFORE view operations
+        mAiSuggestedWords = suggestedWords;
+        mAiPackageName    = sourcePkg;
+        Log.d(TAG, "🤖 AI: showing " + suggestions.size() + " suggestions, pkg=" + sourcePkg);
+
+        // Hide tone panel overlay, show chip strip
+        if (mSuggestionStripView != null) {
+            mSuggestionStripView.showAiSuggestionsReady();
+        }
+
+        mHandler.cancelUpdateSuggestionStrip();
         setSuggestedWords(suggestedWords);
-        Log.d(TAG, "✅ Showing " + suggestions.size() + " AI suggestions");
+        Log.d(TAG, "🤖 AI: ✅ Done");
     }
 
     // Tone panel show/hide
@@ -1687,9 +1831,10 @@ public class LatinIME extends InputMethodService implements
             ).show();
             return;
         }
+        // Naya request — purane AI suggestions clear karo
+        mAiSuggestedWords = null;
+        mAiPackageName    = null;
         Log.d(TAG, "🎭 Requesting suggestions with tone: " + tone);
         mChatAiHelper.requestSuggestions(tone);
     }
 }
-
-

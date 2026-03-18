@@ -5,65 +5,92 @@
     SPDX-License-Identifier: Apache-2.0 AND GPL-3.0-only
 -->
 
-<merge
-    xmlns:android="http://schemas.android.com/apk/res/android">
-    <LinearLayout
-        android:animateLayoutChanges="true"
-        android:id="@+id/suggestions_strip_wrapper"
-        android:orientation="horizontal"
+<!--
+    ROOT CAUSE FIX — Instagram chips invisible issue:
+
+    AiTonePanel was added to SuggestionStripView.parent (outside this view).
+    When strip became INVISIBLE, parent height changed 113px → 226px.
+    Instagram's IME window locked to 226px. Chips rendered outside visible
+    bounds and were clipped by Instagram.
+
+    FIX: Wrap in FrameLayout. AiTonePanel lives in ai_tone_panel_slot
+    (INSIDE this view). Height NEVER changes. No add/remove to parent.
+-->
+<merge xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <FrameLayout
+        android:id="@+id/ai_overlay_container"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:hapticFeedbackEnabled="false"
-        android:soundEffectsEnabled="false">
-        <!-- Provide audio and haptic feedback by ourselves based on the keyboard settings.
-             We just need to ignore the system's audio and haptic feedback settings. -->
-        <ImageButton
-            android:id="@+id/suggestions_strip_toolbar_key"
-            android:layout_width="@dimen/config_suggestions_strip_edge_key_width"
-            android:layout_height="@dimen/config_suggestions_strip_edge_key_width"
-            android:layout_gravity="center_vertical"
-            android:layout_weight="0"
-            android:layout_marginStart="1dp"
-            android:background="@drawable/toolbar_expand_key_background"
-            style="?attr/suggestionWordStyle"
-            android:contentDescription="@string/more_keys_strip_description" />
-        <HorizontalScrollView
-            android:id="@+id/toolbar_container"
-            android:layout_width="0dp"
-            android:layout_weight="1"
+        android:layout_height="match_parent">
+
+        <!-- Normal suggestion strip row -->
+        <LinearLayout
+            android:animateLayoutChanges="true"
+            android:id="@+id/suggestions_strip_wrapper"
+            android:orientation="horizontal"
+            android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:fillViewport="true"
-            android:scrollbarThumbHorizontal="@color/toolbar_scrollbar"
-            android:visibility="gone">
+            android:hapticFeedbackEnabled="false"
+            android:soundEffectsEnabled="false">
+
+            <ImageButton
+                android:id="@+id/suggestions_strip_toolbar_key"
+                android:layout_width="@dimen/config_suggestions_strip_edge_key_width"
+                android:layout_height="@dimen/config_suggestions_strip_edge_key_width"
+                android:layout_gravity="center_vertical"
+                android:layout_weight="0"
+                android:layout_marginStart="1dp"
+                android:background="@drawable/toolbar_expand_key_background"
+                style="?attr/suggestionWordStyle"
+                android:contentDescription="@string/more_keys_strip_description" />
+
+            <HorizontalScrollView
+                android:id="@+id/toolbar_container"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="match_parent"
+                android:fillViewport="true"
+                android:scrollbarThumbHorizontal="@color/toolbar_scrollbar"
+                android:visibility="gone">
+                <LinearLayout
+                    android:id="@+id/toolbar"
+                    android:layout_width="wrap_content"
+                    android:layout_height="match_parent"
+                    android:orientation="horizontal"
+                    style="?attr/suggestionWordStyle" />
+            </HorizontalScrollView>
+
             <LinearLayout
-                android:id="@+id/toolbar"
+                android:id="@+id/suggestions_strip"
+                android:orientation="horizontal"
+                android:maxWidth="100dp"
                 android:layout_width="wrap_content"
                 android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:gravity="center_horizontal"
+                android:hapticFeedbackEnabled="false"
+                android:soundEffectsEnabled="false" />
+
+            <LinearLayout
+                android:id="@+id/pinned_keys"
                 android:orientation="horizontal"
-                style="?attr/suggestionWordStyle">
-            </LinearLayout>
-        </HorizontalScrollView>
-        <!-- Provide audio and haptic feedback by ourselves based on the keyboard settings.
-             We just need to ignore the system's audio and haptic feedback settings. -->
-        <!-- todo: sth is fishy with that maxwidth
-               check what is going on in the layout helper? -->
-        <LinearLayout
-            android:id="@+id/suggestions_strip"
-            android:orientation="horizontal"
-            android:maxWidth="100dp"
-            android:layout_width="wrap_content"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:gravity="center_horizontal"
-            android:hapticFeedbackEnabled="false"
-            android:soundEffectsEnabled="false" />
-        <LinearLayout
-            android:id="@+id/pinned_keys"
-            android:orientation="horizontal"
-            android:layout_width="wrap_content"
-            android:layout_height="match_parent"
-            android:minWidth="0dp"
-            style="?attr/suggestionWordStyle">
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:minWidth="0dp"
+                style="?attr/suggestionWordStyle" />
+
         </LinearLayout>
-    </LinearLayout>
+
+        <!--
+            AiTonePanel overlay — INSIDE this view, so IME height never changes.
+            GONE by default. Shown over strip_wrapper when tone panel is active.
+        -->
+        <FrameLayout
+            android:id="@+id/ai_tone_panel_slot"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone" />
+
+    </FrameLayout>
+
 </merge>
