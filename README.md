@@ -154,3 +154,5 @@ Your support keeps the code **100% Free and Open Source**.
 ---
 
 *LeanType • Privacy-focused keyboard with AI enhancements*
+
+<!-- work -->
