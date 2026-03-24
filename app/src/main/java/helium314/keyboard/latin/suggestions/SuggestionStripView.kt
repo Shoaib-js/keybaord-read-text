@@ -1049,7 +1049,15 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
 
 
     private fun handleAiButtonClick() {
-        if (isAiPanelShowing) hideAiTonePanel() else showAiTonePanel()
+        // Full AI mode: hide keyboard keys, show clipboard-style AI panel
+        val latinIME = context as? LatinIME
+            ?: (context as? android.content.ContextWrapper)?.baseContext as? LatinIME
+        if (latinIME != null) {
+            latinIME.enterAiFullMode()
+        } else {
+            // Fallback: old overlay tone panel
+            if (isAiPanelShowing) hideAiTonePanel() else showAiTonePanel()
+        }
     }
 
     private fun showAiTonePanel() {
@@ -1106,6 +1114,18 @@ class SuggestionStripView(context: Context, attrs: AttributeSet?, defStyle: Int)
         setToolbarVisibility(false)
 
         Log.d(TAG, "🤖 AI_STRIP: showAiSuggestionsReady → strip VISIBLE, overlay GONE, childCount=${suggestionsStrip.childCount}")
+    }
+
+    /** Remove all AI chips and restore normal strip state. */
+    fun clearAiChips() {
+        aiTonePanelSlot.visibility = GONE
+        aiTonePanel?.visibility = GONE
+        isAiPanelShowing = false
+        this.visibility = VISIBLE
+        stripWrapper.visibility = VISIBLE
+        suggestionsStrip.removeAllViews()
+        suggestionsStrip.isVisible = true
+        Log.d(TAG, "🤖 AI_STRIP: clearAiChips()")
     }
 
 }

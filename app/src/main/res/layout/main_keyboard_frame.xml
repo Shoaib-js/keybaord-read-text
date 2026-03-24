@@ -3,8 +3,10 @@
     Copyright (C) 2014 The Android Open Source Project
     modified
     SPDX-License-Identifier: Apache-2.0 AND GPL-3.0-only
--->
 
+    Normal keyboard frame. Set to GONE in AI_MODE, VISIBLE in NORMAL_MODE.
+    AI panel is NOT here — it lives in input_view.xml as a FrameLayout child.
+-->
 <LinearLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
@@ -16,8 +18,6 @@
         android:id="@+id/strip_container"
         layout="@layout/strip_container" />
 
-    <!-- To ensure that key preview popup is correctly placed when the current system locale is
-         one of RTL locales, layoutDirection="ltr" is needed in the SDK version 17+. -->
     <helium314.keyboard.latin.KeyboardWrapperView
         android:id="@+id/keyboard_view_wrapper"
         android:layout_width="match_parent"
@@ -29,9 +29,11 @@
             android:layoutDirection="ltr"
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
+
         <include
             android:id="@+id/emoji_palettes_view"
             layout="@layout/emoji_palettes_view" />
+
         <include
             android:id="@+id/clipboard_history_view"
             layout="@layout/clipboard_history_view" />

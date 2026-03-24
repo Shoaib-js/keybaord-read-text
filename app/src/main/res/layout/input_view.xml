@@ -3,17 +3,35 @@
     Copyright (C) 2011 The Android Open Source Project
     modified
     SPDX-License-Identifier: Apache-2.0 AND GPL-3.0-only
--->
 
+    InputView extends FrameLayout.
+    AI panel lives HERE as a direct child with gravity=bottom + wrap_content.
+    This way keyboard (main_keyboard_frame) goes GONE in AI mode — zero ghost space.
+-->
 <helium314.keyboard.latin.InputView
     xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     style="?attr/inputViewStyle">
+
     <include
         android:id="@+id/fakeToast"
         layout="@layout/fake_toast" />
+
+    <!-- Normal keyboard — GONE in AI mode (zero space) -->
     <include
         android:id="@+id/main_keyboard_frame"
         layout="@layout/main_keyboard_frame" />
+
+    <!--
+        AI suggestions panel.
+        Direct child of FrameLayout → gravity=bottom works correctly.
+        wrap_content → takes ONLY the space it needs (no ghost space).
+        GONE in NORMAL_MODE, VISIBLE in AI_MODE.
+        NEVER inside KeyboardWrapperView (that would cause height issues).
+    -->
+    <include
+        android:id="@+id/ai_full_mode_view"
+        layout="@layout/ai_full_mode_view" />
+
 </helium314.keyboard.latin.InputView>

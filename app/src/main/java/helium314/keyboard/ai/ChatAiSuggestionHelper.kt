@@ -1,16 +1,13 @@
-// ══════════════════════════════════════════════════════════════════
-// FILE LOCATION:
-//   app/src/main/java/helium314/keyboard/ai/ChatAiSuggestionHelper.kt
-//
-// ACTION: REPLACE the ENTIRE existing file with this content.
-// ══════════════════════════════════════════════════════════════════
-
+/*
+ * ChatAiSuggestionHelper.kt — ON-DEMAND VERSION
+ *
+ * Three callbacks:
+ *   onSuggestionsReady — API returned suggestions → show RESULT
+ *   onEmpty            — no messages found → show EMPTY (no API call)
+ *   onError            — API/network error → show error text in panel
+ */
 package helium314.keyboard.ai
 
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.util.Log
 import helium314.keyboard.accessibility.ChatAccessibilityService
 import kotlinx.coroutines.CoroutineScope
@@ -23,23 +20,12 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 
-/**
- * ChatAiSuggestionHelper
- *
- * AccessibilityService se chat messages receive karta hai.
- * User AI button press kare + tone select kare toh backend ko request bhejta hai.
- * Backend se 3 suggestions receive karke keyboard ko deta hai.
- *
- * Architecture:
- *   AccessibilityService → Broadcast → This Helper → Backend API → Suggestions → Keyboard UI
- */
 class ChatAiSuggestionHelper(
-    private val context: Context,
-    private val backendUrl: String,              // Aapka backend URL, e.g. "https://yourserver.com/generate-reply"
+    private val backendUrl: String,
     private val onSuggestionsReady: (List<String>) -> Unit,
-    private val onError: (String) -> Unit = {}   // Optional error callback
+    private val onError: (String) -> Unit = {},
+    private val onEmpty: (() -> Unit)? = null   // called when no messages found
 ) {
-
     companion object {
         private const val TAG = "ChatAiHelper"
         private const val CONNECT_TIMEOUT = 10_000
@@ -47,219 +33,101 @@ class ChatAiSuggestionHelper(
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-    // ── Stored chat context ──
-    private var lastMessagesJson: String = "[]"
-    private var lastPackageName: String  = ""
-    private var lastChatWith: String     = ""
-    // Fix E — chat key: prevents sending stale data if user switches chats before tapping tone
-    private var lastChatKey: String      = ""
-
-    // ════════════════════════════════════════
-    // BROADCAST RECEIVER — AccessibilityService se messages receive karo
-    // ════════════════════════════════════════
-
-    private val chatContextReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != ChatAccessibilityService.ACTION_CHAT_CONTEXT) return
-
-            val messagesJson = intent.getStringExtra(ChatAccessibilityService.EXTRA_MESSAGES) ?: "[]"
-            val pkg          = intent.getStringExtra(ChatAccessibilityService.EXTRA_PACKAGE) ?: ""
-            val chatWith     = intent.getStringExtra(ChatAccessibilityService.EXTRA_CHAT_WITH) ?: ""
-
-            lastMessagesJson = messagesJson
-            lastPackageName  = pkg
-            lastChatWith     = chatWith
-            lastChatKey      = "$pkg:$chatWith"   // Fix E — track which chat this data belongs to
-
-            Log.d(TAG, "📩 Context received: app=$pkg | chat_with=$chatWith")
-        }
-    }
-
-    // ════════════════════════════════════════
-    // REGISTER / UNREGISTER
-    // ════════════════════════════════════════
-
-    fun register() {
-        val filter = IntentFilter(ChatAccessibilityService.ACTION_CHAT_CONTEXT)
-        context.registerReceiver(chatContextReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        Log.d(TAG, "ChatAiSuggestionHelper registered")
-    }
-
-    fun unregister() {
-        try {
-            context.unregisterReceiver(chatContextReceiver)
-        } catch (e: Exception) {
-            Log.w(TAG, "Receiver not registered: ${e.message}")
-        }
-    }
-
-    // ════════════════════════════════════════
-    // MAIN METHOD — User ne AI button + tone press kiya
-    // Ye method keyboard se call hogi
-    // ════════════════════════════════════════
+    @Volatile private var isRequestInFlight = false
 
     fun requestSuggestions(tone: String) {
-        if (lastMessagesJson == "[]" || lastMessagesJson.isEmpty()) {
-            Log.w(TAG, "No chat context available — chat screen pe jao pehle")
-            onError("Koi chat context nahi mila. Pehle WhatsApp ya Instagram chat kholo.")
+        if (isRequestInFlight) {
+            Log.d(TAG, "Request in flight — ignoring duplicate")
             return
         }
 
-        // App name short karo
-        val appName = when {
-            lastPackageName.startsWith("com.whatsapp") -> "whatsapp"
-            lastPackageName == "com.instagram.android"  -> "instagram"
-            else -> lastPackageName
+        val service = ChatAccessibilityService.instance
+        if (service == null) {
+            onError("Accessibility service not running. Enable LeanType in Accessibility Settings.")
+            return
         }
 
-        // Fix E — snapshot current chat key; validate in coroutine before sending
-        val requestChatKey   = lastChatKey
-        val requestMessages  = lastMessagesJson
-        val requestChatWith  = lastChatWith
+        val pkg = service.currentPackage
+        if (pkg.isBlank()) {
+            onEmpty?.invoke() ?: onError("Open a WhatsApp or Instagram chat first.")
+            return
+        }
 
-        Log.d(TAG, "🚀 Requesting suggestions | app=$appName | tone=$tone | chat_with=$requestChatWith")
+        isRequestInFlight = true
+        Log.d(TAG, "🔍 On-demand extraction | pkg=$pkg | tone=$tone")
 
         scope.launch {
             try {
-                // Fix E — if chat changed between tap and coroutine start, abort
-                if (requestChatKey != lastChatKey) {
-                    Log.w(TAG, "⚠️ Stale context: $requestChatKey vs $lastChatKey — aborting")
-                    onError("Chat badal gaya — dobara try karo.")
+                val result = OnDemandMessageExtractor.extractNow(service, pkg)
+
+                // ── No result at all (accessibility error) ─────────────────
+                if (result == null) {
+                    onError("Could not read screen. Check Accessibility permission.")
                     return@launch
                 }
 
-                // JSON payload build karo
-                val payload = buildPayload(appName, requestChatWith, tone, requestMessages)
+                // ── Empty result: wrong screen or no messages visible ───────
+                // Do NOT call API. Show EMPTY state — clean UX, no error color.
+                if (result.messageCount == 0) {
+                    Log.d(TAG, "📭 No messages — showing empty state (no API call)")
+//                    onEmpty?.invoke() ?: onError("Open a chat conversation with messages, then tap AI.")
+                    onEmpty?.invoke() ?: onError("Open a chat with messages")
+                    return@launch
+                }
+
+                Log.d(TAG, "✅ Extracted ${result.messageCount} messages for '${result.chatWith}'")
+
+                val payload = buildPayload(result.appName, result.chatWith, tone, result.messagesJson)
                 Log.d(TAG, "📤 Payload: $payload")
 
-                // Backend ko bhejo
                 val response = postToBackend(payload)
                 Log.d(TAG, "📥 Response: $response")
 
-                // Parse karo
                 val suggestions = parseResponse(response)
-
-                // Keyboard ko do
                 onSuggestionsReady(suggestions)
 
             } catch (e: Exception) {
-                Log.e(TAG, "❌ API error: ${e.message}")
-                onError("Server error: ${e.message}")
+                Log.e(TAG, "❌ Error: ${e.message}")
+                onError(e.message ?: "Unknown error")
+            } finally {
+                isRequestInFlight = false
             }
         }
     }
 
-    // ════════════════════════════════════════
-    // PAYLOAD BUILDER
-    // ════════════════════════════════════════
-
-    private fun buildPayload(
-        app:          String,
-        chatWith:     String,
-        tone:         String,
-        messagesJson: String
-    ): String {
-        val obj = JSONObject()
-        obj.put("app",       app)
-        obj.put("chat_with", chatWith)
-        obj.put("tone",      tone)
-        obj.put("messages",  JSONArray(messagesJson))   // Already valid JSON from AccessibilityService
-        return obj.toString()
-    }
-
-    // ════════════════════════════════════════
-    // HTTP POST TO BACKEND
-    // ════════════════════════════════════════
+    private fun buildPayload(app: String, chatWith: String, tone: String, messages: String) =
+        JSONObject().apply {
+            put("app", app)
+            put("chat_with", chatWith)
+            put("tone", tone)
+            put("messages", JSONArray(messages))
+        }.toString()
 
     private fun postToBackend(payload: String): String {
-        val url = URL(backendUrl)
-        val conn = url.openConnection() as HttpURLConnection
-
+        val conn = URL(backendUrl).openConnection() as HttpURLConnection
         return try {
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
             conn.setRequestProperty("Accept", "application/json")
-            conn.doOutput     = true
-            conn.doInput      = true
-            conn.connectTimeout = CONNECT_TIMEOUT
-            conn.readTimeout    = READ_TIMEOUT
-
-            // Request body bhejo
-            OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { writer ->
-                writer.write(payload)
-                writer.flush()
-            }
-
-            // Response code check karo
-            val responseCode = conn.responseCode
-            if (responseCode !in 200..299) {
-                val errorBody = conn.errorStream?.bufferedReader()?.readText() ?: "No error body"
-                throw Exception("HTTP $responseCode: $errorBody")
-            }
-
-            // Response read karo
+            conn.doOutput = true; conn.doInput = true
+            conn.connectTimeout = CONNECT_TIMEOUT; conn.readTimeout = READ_TIMEOUT
+            OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload); it.flush() }
+            val code = conn.responseCode
+            if (code !in 200..299) throw Exception("HTTP $code: ${conn.errorStream?.bufferedReader()?.readText()}")
             conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
-
-        } finally {
-            conn.disconnect()
-        }
+        } finally { conn.disconnect() }
     }
 
-    // ════════════════════════════════════════
-    // RESPONSE PARSER
-    // ════════════════════════════════════════
-
-    private fun parseResponse(responseJson: String): List<String> {
-        return try {
-            val json = JSONObject(responseJson)
-
-            // Status check karo
-            val status = json.optString("status", "")
-            if (status != "success") {
-                val errorMsg = json.optString("error", "Backend error")
-                throw Exception(errorMsg)
-            }
-
-            // suggestions array nikalo
-            val suggestionsArray = json.getJSONArray("suggestions")
-            val list = mutableListOf<String>()
-            for (i in 0 until suggestionsArray.length()) {
-                val suggestion = suggestionsArray.getString(i).trim()
-                if (suggestion.isNotEmpty()) {
-                    list.add(suggestion)
-                }
-            }
-
-            if (list.isEmpty()) {
-                throw Exception("Backend ne empty suggestions diye")
-            }
-
-            list
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Parse error: ${e.message} | Response: $responseJson")
-            throw Exception("Response parse nahi hua: ${e.message}")
-        }
+    private fun parseResponse(json: String): List<String> {
+        val obj = JSONObject(json)
+        if (obj.optString("status") != "success") throw Exception(obj.optString("error", "Backend error"))
+        val arr  = obj.getJSONArray("suggestions")
+        val list = (0 until arr.length()).map { arr.getString(it).trim() }.filter { it.isNotEmpty() }
+        if (list.isEmpty()) throw Exception("Empty suggestions from backend")
+        return list
     }
 
-    // ════════════════════════════════════════
-    // UTILITY: Stored context clear karo
-    // ════════════════════════════════════════
-
-    fun clearContext() {
-        lastMessagesJson = "[]"
-        lastPackageName  = ""
-        lastChatWith     = ""
-        lastChatKey      = ""
-        Log.d(TAG, "Context cleared")
-    }
-
-    // ════════════════════════════════════════
-    // UTILITY: Check if context is available
-    // ════════════════════════════════════════
-
-    fun hasContext(): Boolean {
-        return lastMessagesJson != "[]" && lastMessagesJson.isNotEmpty()
-    }
+    fun register() {}
+    fun unregister() {}
+    fun hasContext(): Boolean = ChatAccessibilityService.instance != null
 }

@@ -98,9 +98,9 @@ import androidx.core.content.ContextCompat;
 
 // AI Chat Suggestion Helper
 import helium314.keyboard.ai.ChatAiSuggestionHelper;
-import helium314.keyboard.chat.ChatBridgeReceiver;
+// ChatBridgeReceiver import removed — on-demand arch
 
-import helium314.keyboard.ai.AiTonePanel;
+// AiTonePanel is now inside AiFullModeView — no direct import needed
 
 /**
  * Input method implementation for Qwerty'ish keyboard.
@@ -190,8 +190,8 @@ public class LatinIME extends InputMethodService implements
     private SuggestedWords mPendingAiSuggestions = null;
     // Pending ke saath source package store karo — taaki wrong app pe apply na ho.
     private String mPendingAiPackageName = null;
-    private ChatBridgeReceiver mChatBridgeReceiver;
-    private AiTonePanel mAiTonePanel;
+    // mChatBridgeReceiver removed — on-demand arch has no broadcast receiver
+    // mAiTonePanel removed — tone panel is now inside AiFullModeView
     private boolean mIsAiPanelVisible = false;
     // ──────────────────────────────────────────────────────────────────────
 
@@ -578,39 +578,26 @@ public class LatinIME extends InputMethodService implements
 
         StatsUtils.onCreate(mSettings.getCurrent(), mRichImm);
 
-        // ── Initialize ChatAiSuggestionHelper ──────────────────────────────
-        String backendUrl = "https://aisuggestionbackend.tcqstaging.space/api/reply/suggest";
-        // TODO: Upar wali line mein apna actual backend URL daalo
+        // ── Initialize ChatAiSuggestionHelper (ON-DEMAND) ──────────────────
+        final String backendUrl = "https://aisuggestionbackend.tcqstaging.space/api/reply/suggest";
 
         mChatAiHelper = new ChatAiSuggestionHelper(
-            this,
             backendUrl,
             suggestions -> {
-                mHandler.post(() -> {
-                    showAiSuggestions(suggestions);
-                });
+                mHandler.post(() -> showAiFullModeSuggestions(suggestions));
                 return null;
             },
             errorMessage -> {
-                mHandler.post(() -> {
-                    Log.e(TAG, "AI Error: " + errorMessage);
-                    android.widget.Toast.makeText(
-                        LatinIME.this,
-                        errorMessage,
-                        android.widget.Toast.LENGTH_SHORT
-                    ).show();
-                });
+                mHandler.post(() -> showAiFullModeError(errorMessage));
+                return null;
+            },
+            // onEmpty: no messages found — show EMPTY state, no API call, no error color
+            () -> {
+                mHandler.post(() -> showAiFullModeEmpty());
                 return null;
             }
         );
-        mChatAiHelper.register();
-        Log.i(TAG, "ChatAiSuggestionHelper initialized");
-        // ──────────────────────────────────────────────────────────────────
-
-        // ── Initialize ChatBridgeReceiver (populates MessageCache.shared) ──
-        mChatBridgeReceiver = new ChatBridgeReceiver();
-        mChatBridgeReceiver.register(this);
-        Log.i(TAG, "ChatBridgeReceiver initialized");
+        Log.i(TAG, "ChatAiSuggestionHelper initialized (on-demand mode)");
         // ──────────────────────────────────────────────────────────────────
 
     }
@@ -702,12 +689,7 @@ public class LatinIME extends InputMethodService implements
     public void onDestroy() {
         // ── Cleanup AI Chat Suggestion Helper ──────────────────────────────
         if (mChatAiHelper != null) {
-            mChatAiHelper.unregister();
             mChatAiHelper = null;
-        }
-        if (mChatBridgeReceiver != null) {
-            mChatBridgeReceiver.unregister(this);
-            mChatBridgeReceiver = null;
         }
         // ──────────────────────────────────────────────────────────────────
         mClipboardHistoryManager.onDestroy();
@@ -797,6 +779,8 @@ public class LatinIME extends InputMethodService implements
         mHandler.onFinishInputView(finishingInput);
         mStatsUtilsManager.onFinishInputView();
         mGestureConsumer = GestureConsumer.NULL_GESTURE_CONSUMER;
+        // If AI panel was open, exit cleanly so next open starts fresh
+        if (mKeyboardSwitcher.isInAiFullMode()) exitAiFullMode();
     }
 
     @Override
@@ -845,14 +829,14 @@ public class LatinIME extends InputMethodService implements
     void onStartInputViewInternal(final EditorInfo editorInfo, final boolean restarting) {
         super.onStartInputView(editorInfo, restarting);
 
-        // ── Jab WhatsApp Send karo → input restart hota hai (restarting=true, cursor=0)
-        // Ye AI mode clear karta hai taaki agle suggestion fresh aaye ──
+        // ── Message sent → input restarts → exit AI full mode ────────────
         if (restarting && mAiSuggestedWords != null) {
             Log.d(TAG, "🤖 AI_GUARD: input restarting after send → clearing AI mode");
             mAiSuggestedWords     = null;
             mAiPackageName        = null;
             mPendingAiSuggestions = null;
             mPendingAiPackageName = null;
+            if (mKeyboardSwitcher.isInAiFullMode()) mKeyboardSwitcher.exitAiFullMode();
         }
 
         // ── Pending AI suggestions (Instagram fix) ────────────────────────
@@ -878,6 +862,7 @@ public class LatinIME extends InputMethodService implements
                 mAiPackageName        = null;
                 mPendingAiSuggestions = null;
                 mPendingAiPackageName = null;
+                if (mKeyboardSwitcher.isInAiFullMode()) mKeyboardSwitcher.exitAiFullMode();
             }
 
             // ── Case 2: apply pending suggestions ─────────────────────────
@@ -1124,6 +1109,8 @@ public class LatinIME extends InputMethodService implements
         Log.i(TAG, "hideWindow");
         if (hasSuggestionStripView() && mSettings.getCurrent().mToolbarMode == ToolbarMode.EXPANDABLE)
             mSuggestionStripView.setToolbarVisibility(false);
+        // Exit AI full mode so keyboard is restored next time IME opens
+        if (mKeyboardSwitcher.isInAiFullMode()) exitAiFullMode();
         mKeyboardSwitcher.onHideWindow();
         if (TRACE)
             Debug.stopMethodTracing();
@@ -1177,6 +1164,31 @@ public class LatinIME extends InputMethodService implements
         if (mInputView == null) {
             return;
         }
+
+        // ── AI FULL MODE: shrink IME to only the AI panel height ──────────
+        // When keyboard is GONE, we must tell Android the content starts at
+        // (inputHeight - aiPanelHeight). This moves WhatsApp's input bar up
+        // by only aiPanelHeight — removing the black empty space completely.
+        if (mKeyboardSwitcher.isInAiFullMode()) {
+            final helium314.keyboard.ai.AiFullModeView aiPanel =
+                mKeyboardSwitcher.getAiFullModeView();
+            if (aiPanel != null && aiPanel.getHeight() > 0) {
+                final int inputHeight  = mInputView.getHeight();
+                final int panelHeight  = aiPanel.getHeight();
+                final int navBarHeight = aiPanel.getNavBarHeight();
+                // visibleTopY = where AI panel starts (panel includes nav bar padding at bottom)
+                final int visibleTopY  = inputHeight - panelHeight;
+                outInsets.contentTopInsets = visibleTopY;
+                outInsets.visibleTopInsets = visibleTopY;
+                outInsets.touchableInsets = InputMethodService.Insets.TOUCHABLE_INSETS_REGION;
+                outInsets.touchableRegion.set(0, visibleTopY, mInputView.getWidth(),
+                    inputHeight + EXTENDED_TOUCHABLE_REGION_HEIGHT);
+                mInsetsUpdater.setInsets(outInsets);
+                return;
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────
+
         final View visibleKeyboardView = mKeyboardSwitcher.getWrapperView();
         if (visibleKeyboardView == null) {
             return;
@@ -1452,16 +1464,6 @@ public class LatinIME extends InputMethodService implements
         if (!onEvaluateInputViewShown()) {
             return;
         }
-        // ── AI MODE: bypass suggestion gate ───────────────────────────────
-        // AI chips must show regardless of whether suggestions are enabled
-        // in user settings. The gate below silently skips setSuggestions()
-        // when suggestions are off, causing a blank strip after API response.
-        if (suggestedWords == mAiSuggestedWords) {
-            mSuggestionStripView.setSuggestions(suggestedWords,
-                mRichImm.getCurrentSubtype().isRtlSubtype());
-            return;
-        }
-        // ─────────────────────────────────────────────────────────────────
         final boolean isEmptyApplicationSpecifiedCompletions = currentSettingsValues
             .isApplicationSpecifiedCompletionsOn()
             && suggestedWords.isEmpty();
@@ -1758,83 +1760,146 @@ public class LatinIME extends InputMethodService implements
     // AI REPLY METHODS
     // ════════════════════════════════════════════════════════════
 
-    // SuggestionStripView mein AI suggestions dikhao
+
+    // ════════════════════════════════════════════════════════════════════
+    // AI FULL MODE — Complete State Machine
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * Called from SuggestionStripView AI button click.
+     * Enters Full AI Mode: keyboard keys hidden, AiFullModeView shown with tone picker.
+     */
+    /**
+     * Forces onComputeInsets() to re-run after AI mode enters/exits.
+     * This tells Android the new IME height → removes black space.
+     * Called via post() from KeyboardSwitcher after one layout pass
+     * so aiPanel.getHeight() > 0 when onComputeInsets runs.
+     */
+    public void updateInsetsForAiMode() {
+        if (mInputView != null) {
+            mInputView.requestLayout();
+        }
+    }
+
+    public void enterAiFullMode() {
+        if (mChatAiHelper == null) return;
+
+        Log.d(TAG, "🤖 enterAiFullMode()");
+
+        // Wire callbacks every time (view is re-inflated on theme change)
+        wireAiFullModeCallbacks();
+
+        // Hide keys and show the AI panel
+        mKeyboardSwitcher.enterAiFullMode();
+
+        // Transition panel to TONE state (shows tone picker)
+        final helium314.keyboard.ai.AiFullModeView panel = mKeyboardSwitcher.getAiFullModeView();
+        if (panel != null) panel.showTone();
+    }
+
+    /**
+     * Wire the AiFullModeView callbacks.
+     * Called every enterAiFullMode() because the view can be re-inflated on theme change.
+     */
+    private void wireAiFullModeCallbacks() {
+        final helium314.keyboard.ai.AiFullModeView panel = mKeyboardSwitcher.getAiFullModeView();
+        if (panel == null) return;
+
+        // Tone tapped → show loading immediately, then fire API
+        panel.setOnToneSelected((java.util.function.Consumer<String>) tone -> {
+            Log.d(TAG, "🎭 Tone tapped: " + tone);
+            if (mChatAiHelper == null) return;
+            // Panel's own AiTonePanel already called showLoading() internally;
+            // also tell KeyboardSwitcher so the panel state is consistent.
+            mKeyboardSwitcher.showAiFullModeLoading();
+            mChatAiHelper.requestSuggestions(tone);
+        });
+
+        // Suggestion row tapped → commit text + exit
+        panel.setOnSuggestionTapped((java.util.function.Consumer<String>) text -> {
+            Log.d(TAG, "✅ Suggestion tapped");
+            commitAiSuggestion(text);
+        });
+
+        // Close (✕) tapped → exit AI mode, restore keyboard
+        panel.setOnClose(() -> exitAiFullMode());
+
+        // Retry tapped → panel already went back to TONE state; nothing extra needed
+        panel.setOnRetry(() -> Log.d(TAG, "🤖 Retry: tone picker re-shown"));
+    }
+
+    /**
+     * Commit the selected suggestion text and exit AI mode.
+     */
+    private void commitAiSuggestion(final String text) {
+        final android.view.inputmethod.InputConnection ic = getCurrentInputConnection();
+        if (ic != null) {
+            ic.commitText(text, 1);
+            Log.d(TAG, "🤖 commitAiSuggestion: committed " + text.length() + " chars");
+        }
+        exitAiFullMode();
+    }
+
+    /**
+     * Exit AI Full Mode and restore normal keyboard.
+     */
+    public void exitAiFullMode() {
+        Log.d(TAG, "🤖 exitAiFullMode()");
+        mKeyboardSwitcher.exitAiFullMode();
+        // Clear any stale AI suggestion state
+        mAiSuggestedWords     = null;
+        mAiPackageName        = null;
+        mPendingAiSuggestions = null;
+        mPendingAiPackageName = null;
+    }
+
+    /**
+     * Called from ChatAiSuggestionHelper when API returns suggestions.
+     * Runs on main thread (via mHandler.post).
+     */
+    public void showAiFullModeSuggestions(java.util.List<String> suggestions) {
+        if (suggestions == null || suggestions.isEmpty()) {
+            showAiFullModeError("No suggestions returned. Please try again.");
+            return;
+        }
+        Log.d(TAG, "🤖 showAiFullModeSuggestions: " + suggestions.size() + " items");
+        mKeyboardSwitcher.showAiFullModeResult(suggestions);
+    }
+
+    /**
+     * Called from ChatAiSuggestionHelper on API error.
+     * Runs on main thread.
+     */
+    public void showAiFullModeError(final String message) {
+        Log.e(TAG, "🤖 AI error: " + message);
+        mKeyboardSwitcher.showAiFullModeError(message);
+    }
+
+    /** Called when extraction found no messages — show EMPTY state, no API called. */
+    public void showAiFullModeEmpty() {
+        Log.d(TAG, "🤖 AI empty — no messages found");
+        mKeyboardSwitcher.showAiFullModeEmpty();
+    }
+
+    // ── Legacy strip-chip methods (kept for compat, no longer primary path) ─
+
+    /** @deprecated Use showAiFullModeSuggestions instead */
     public void showAiSuggestions(java.util.List<String> suggestions) {
-        if (suggestions == null || suggestions.isEmpty()) return;
-
-        final ArrayList<SuggestedWords.SuggestedWordInfo> wordInfoList = new ArrayList<>();
-        for (String suggestion : suggestions) {
-            wordInfoList.add(new SuggestedWords.SuggestedWordInfo(
-                suggestion,
-                "",
-                SuggestedWords.SuggestedWordInfo.MAX_SCORE,
-                SuggestedWords.SuggestedWordInfo.KIND_APP_DEFINED,
-                null,
-                SuggestedWords.SuggestedWordInfo.NOT_AN_INDEX,
-                SuggestedWords.SuggestedWordInfo.NOT_A_CONFIDENCE
-            ));
-        }
-
-        final SuggestedWords suggestedWords = new SuggestedWords(
-            wordInfoList, null, null, false, false, false,
-            SuggestedWords.INPUT_STYLE_APPLICATION_SPECIFIED,
-            SuggestedWords.NOT_A_SEQUENCE_NUMBER
-        );
-
-        // Capture source package for cross-app guard
-        final String sourcePkg = (getCurrentInputEditorInfo() != null)
-            ? getCurrentInputEditorInfo().packageName : null;
-
-        // Store pending so suggestions survive Instagram keyboard dismiss
-        mPendingAiSuggestions = suggestedWords;
-        mPendingAiPackageName = sourcePkg;
-
-        // Activate guard BEFORE view operations
-        mAiSuggestedWords = suggestedWords;
-        mAiPackageName    = sourcePkg;
-        Log.d(TAG, "🤖 AI: showing " + suggestions.size() + " suggestions, pkg=" + sourcePkg);
-
-        // Hide tone panel overlay, show chip strip
-        if (mSuggestionStripView != null) {
-            mSuggestionStripView.showAiSuggestionsReady();
-        }
-
-        mHandler.cancelUpdateSuggestionStrip();
-        setSuggestedWords(suggestedWords);
-        Log.d(TAG, "🤖 AI: ✅ Done");
+        showAiFullModeSuggestions(suggestions);
     }
 
-    // Tone panel show/hide
-    public void showAiTonePanel() {
-        mIsAiPanelVisible = true;
-    }
+    public void showAiTonePanel()   { mIsAiPanelVisible = true; }
+    public void hideAiTonePanel()   { mIsAiPanelVisible = false; }
+    public boolean isAiPanelVisible() { return mIsAiPanelVisible; }
 
-    public void hideAiTonePanel() {
-        mIsAiPanelVisible = false;
-    }
-
-    public boolean isAiPanelVisible() {
-        return mIsAiPanelVisible;
-    }
-
-    // SuggestionStripView se call hoga jab user tone select kare
+    /**
+     * Called by SuggestionStripView (legacy path, still works for strip-chip flow).
+     */
     public void onAiToneSelected(String tone) {
-        if (mChatAiHelper == null) {
-            Log.w(TAG, "ChatAiHelper not initialized");
-            return;
-        }
-        if (!mChatAiHelper.hasContext()) {
-            android.widget.Toast.makeText(
-                this,
-                "Pehle WhatsApp ya Instagram chat kholo",
-                android.widget.Toast.LENGTH_SHORT
-            ).show();
-            return;
-        }
-        // Naya request — purane AI suggestions clear karo
+        if (mChatAiHelper == null) return;
         mAiSuggestedWords = null;
         mAiPackageName    = null;
-        Log.d(TAG, "🎭 Requesting suggestions with tone: " + tone);
+        Log.d(TAG, "🎭 onAiToneSelected: " + tone);
         mChatAiHelper.requestSuggestions(tone);
     }
 }

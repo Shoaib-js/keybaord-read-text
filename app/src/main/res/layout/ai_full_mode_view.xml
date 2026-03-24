@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    AI suggestions panel.
+    Parent = InputView (FrameLayout) → layout_gravity=bottom works.
+    layout_height = wrap_content → ONLY takes space it needs.
+    GONE by default. VISIBLE only in AI_MODE.
+-->
+<helium314.keyboard.ai.AiFullModeView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/ai_full_mode_view"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_gravity="bottom"
+    android:orientation="vertical"
+    android:visibility="gone" />
